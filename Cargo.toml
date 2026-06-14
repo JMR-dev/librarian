@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/librarian-core",
+    "crates/librarian-win",
+    "crates/librarian-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+librarian-core = { path = "crates/librarian-core" }
+librarian-win = { path = "crates/librarian-win" }
+
+iced = { version = "0.14.0", features = ["image", "lazy", "advanced", "tokio"] }
+windows = { version = "0.62.2" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -1,0 +1,17 @@
+[package]
+name = "librarian-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "librarian"
+path = "src/main.rs"
+
+[dependencies]
+librarian-core.workspace = true
+librarian-win.workspace = true
+iced.workspace = true
+chrono = "0.4"
+notify-debouncer-mini = "0.7.0"
