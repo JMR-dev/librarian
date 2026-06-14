@@ -56,14 +56,14 @@ pub fn extract_icons(worker: &ShellWorker, keys: Vec<IconKey>) -> Vec<(IconKey, 
     keys.into_iter()
         .filter_map(|key| {
             let image = match &key {
-                IconKey::Folder => worker.run(|| folder_icon(false)),
+                IconKey::Folder => worker.run(|apt| folder_icon(apt, false)),
                 IconKey::Ext(ext) => {
                     let ext = ext.clone();
-                    worker.run(move || icon_for_extension(&ext, false))
+                    worker.run(move |apt| icon_for_extension(apt, &ext, false))
                 }
                 IconKey::Path(path) => {
                     let path = path.clone();
-                    worker.run(move || icon_for_path(&path, false))
+                    worker.run(move |apt| icon_for_path(apt, &path, false))
                 }
             };
             image.map(|img| (key, img))

@@ -21,11 +21,12 @@ use windows::Win32::UI::Shell::{
     FOF_ALLOWUNDO, FOF_NOCONFIRMMKDIR, FOFX_RECYCLEONDELETE,
 };
 
+use crate::com::Apartment;
 use crate::util::to_wide;
 
 /// Send the given paths to the Recycle Bin, showing native progress and
 /// recording an undo entry. No-op for an empty slice.
-pub fn delete_to_recycle(paths: &[PathBuf]) -> Result<(), String> {
+pub fn delete_to_recycle(_apt: &Apartment, paths: &[PathBuf]) -> Result<(), String> {
     if paths.is_empty() {
         return Ok(());
     }
@@ -39,7 +40,7 @@ pub fn delete_to_recycle(paths: &[PathBuf]) -> Result<(), String> {
 }
 
 /// Rename a single item in place. `new_name` is a bare name (no path).
-pub fn rename(path: &Path, new_name: &str) -> Result<(), String> {
+pub fn rename(_apt: &Apartment, path: &Path, new_name: &str) -> Result<(), String> {
     let new_wide = to_wide(new_name);
     with_operation(FOF_ALLOWUNDO, |op| {
         let item = shell_item(path)?;
@@ -48,7 +49,7 @@ pub fn rename(path: &Path, new_name: &str) -> Result<(), String> {
 }
 
 /// Create a new folder named `name` inside `parent`.
-pub fn create_folder(parent: &Path, name: &str) -> Result<(), String> {
+pub fn create_folder(_apt: &Apartment, parent: &Path, name: &str) -> Result<(), String> {
     let name_wide = to_wide(name);
     with_operation(FOF_ALLOWUNDO | FOF_NOCONFIRMMKDIR, |op| {
         let dest = shell_item(parent)?;
@@ -66,12 +67,12 @@ pub fn create_folder(parent: &Path, name: &str) -> Result<(), String> {
 }
 
 /// Copy the given paths into `dest_dir`, with native conflict handling.
-pub fn copy_items(paths: &[PathBuf], dest_dir: &Path) -> Result<(), String> {
+pub fn copy_items(_apt: &Apartment, paths: &[PathBuf], dest_dir: &Path) -> Result<(), String> {
     transfer(paths, dest_dir, Transfer::Copy)
 }
 
 /// Move the given paths into `dest_dir`, with native conflict handling.
-pub fn move_items(paths: &[PathBuf], dest_dir: &Path) -> Result<(), String> {
+pub fn move_items(_apt: &Apartment, paths: &[PathBuf], dest_dir: &Path) -> Result<(), String> {
     transfer(paths, dest_dir, Transfer::Move)
 }
 
@@ -166,14 +167,14 @@ mod tests {
         // Create.
         let r = root.clone();
         worker()
-            .run(move || create_folder(&r, "alpha"))
+            .run(move |apt| create_folder(apt, &r, "alpha"))
             .expect("create_folder");
         assert!(root.join("alpha").is_dir());
 
         // Rename.
         let target = root.join("alpha");
         worker()
-            .run(move || rename(&target, "beta"))
+            .run(move |apt| rename(apt, &target, "beta"))
             .expect("rename");
         assert!(!root.join("alpha").exists());
         assert!(root.join("beta").is_dir());
@@ -181,7 +182,7 @@ mod tests {
         // Recycle.
         let beta = root.join("beta");
         worker()
-            .run(move || delete_to_recycle(&[beta]))
+            .run(move |apt| delete_to_recycle(apt, &[beta]))
             .expect("delete_to_recycle");
         assert!(!root.join("beta").exists());
     }
@@ -199,7 +200,7 @@ mod tests {
         // Copy: original stays, copy appears.
         let (s, d) = (src_dir.join("file.txt"), dst_dir.clone());
         worker()
-            .run(move || copy_items(&[s], &d))
+            .run(move |apt| copy_items(apt, &[s], &d))
             .expect("copy_items");
         assert!(src_dir.join("file.txt").exists());
         assert!(dst_dir.join("file.txt").exists());
@@ -209,7 +210,7 @@ mod tests {
         std::fs::create_dir_all(&moved_dir).unwrap();
         let (s, d) = (dst_dir.join("file.txt"), moved_dir.clone());
         worker()
-            .run(move || move_items(&[s], &d))
+            .run(move |apt| move_items(apt, &[s], &d))
             .expect("move_items");
         assert!(!dst_dir.join("file.txt").exists());
         assert!(moved_dir.join("file.txt").exists());

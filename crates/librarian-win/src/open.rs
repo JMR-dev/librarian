@@ -6,12 +6,17 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
+use crate::com::Apartment;
 use crate::util::to_wide;
 
 /// Open `path` with its default associated application (the shell "open" verb).
 /// Returns `true` on success. Use for files; directories are navigated inside
 /// the app rather than handed to the shell.
-pub fn open_path(path: &Path) -> bool {
+///
+/// `ShellExecuteW` can delegate to shell-extension handlers, which expect an
+/// initialized COM apartment — hence the [`Apartment`] witness, requiring this
+/// to run on the STA worker like the other shell calls.
+pub fn open_path(_apt: &Apartment, path: &Path) -> bool {
     let file = to_wide(&path.to_string_lossy());
     let result = unsafe {
         ShellExecuteW(

@@ -22,7 +22,7 @@ use librarian_core::{
 };
 use librarian_win::{
     copy_items, create_folder, delete_to_recycle, known_folders, list_drives, move_items, rename,
-    DriveInfo, IconImage, KnownFolder, ShellWorker,
+    Apartment, DriveInfo, IconImage, KnownFolder, ShellWorker,
 };
 
 use icons::{extract_icons, IconCache, IconKey};
@@ -424,7 +424,8 @@ impl Librarian {
                 self.menu = None;
                 if let Some(dir) = self.current_dir() {
                     let name = unique_folder_name(&dir);
-                    return self.dispatch_op("New folder", move || create_folder(&dir, &name));
+                    return self
+                        .dispatch_op("New folder", move |apt| create_folder(apt, &dir, &name));
                 }
             }
             Message::DeleteSelected => {
@@ -432,7 +433,7 @@ impl Librarian {
                 let paths = self.selected_paths();
                 if !paths.is_empty() {
                     let label = format!("Deleting {} item{}", paths.len(), plural(paths.len()));
-                    return self.dispatch_op(&label, move || delete_to_recycle(&paths));
+                    return self.dispatch_op(&label, move |apt| delete_to_recycle(apt, &paths));
                 }
             }
             Message::Copy => {
@@ -456,11 +457,11 @@ impl Librarian {
                 if let (Some(dir), Some(clip)) = (self.current_dir(), self.clip.take()) {
                     let Clip { paths, cut } = clip;
                     let label = if cut { "Moving" } else { "Copying" };
-                    return self.dispatch_op(label, move || {
+                    return self.dispatch_op(label, move |apt| {
                         if cut {
-                            move_items(&paths, &dir)
+                            move_items(apt, &paths, &dir)
                         } else {
-                            copy_items(&paths, &dir)
+                            copy_items(apt, &paths, &dir)
                         }
                     });
                 }
@@ -491,7 +492,8 @@ impl Librarian {
                     let new_name = state.value.trim().to_string();
                     if !new_name.is_empty() && new_name != row.label {
                         let path = path.clone();
-                        return self.dispatch_op("Renaming", move || rename(&path, &new_name));
+                        return self
+                            .dispatch_op("Renaming", move |apt| rename(apt, &path, &new_name));
                     }
                 }
             }
@@ -527,7 +529,7 @@ impl Librarian {
                 self.rows.clear();
                 let worker = self.worker.clone();
                 Task::perform(
-                    offload(move || (list_drives(), worker.run(known_folders))),
+                    offload(move || (list_drives(), worker.run(|_| known_folders()))),
                     |(drives, folders)| Message::ThisPcLoaded(drives, folders),
                 )
             }
@@ -585,9 +587,12 @@ impl Librarian {
             self.navigate(target)
         } else {
             if let Location::Path(path) = target {
-                // Fire-and-forget; opening shouldn't block the UI.
+                // Fire-and-forget; opening shouldn't block the UI. `ShellExecuteW`
+                // must run on the STA worker (it can invoke shell handlers), and
+                // the temporary thread absorbs the blocking wait off the UI thread.
+                let worker = self.worker.clone();
                 std::thread::spawn(move || {
-                    librarian_win::open_path(&path);
+                    worker.run(move |apt| librarian_win::open_path(apt, &path));
                 });
             }
             Task::none()
@@ -714,7 +719,7 @@ impl Librarian {
     /// refresh the listing when it finishes.
     fn dispatch_op<F>(&mut self, label: &str, op: F) -> Task<Message>
     where
-        F: FnOnce() -> Result<(), String> + Send + 'static,
+        F: FnOnce(&Apartment) -> Result<(), String> + Send + 'static,
     {
         self.menu = None;
         self.status = format!("{label}…");

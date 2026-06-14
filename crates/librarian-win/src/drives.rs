@@ -70,18 +70,13 @@ pub fn list_drives() -> Vec<DriveInfo> {
         let kind = DriveKind::from_raw(unsafe { GetDriveTypeW(root) });
 
         let mut label_buf = [0u16; 256];
-        let label = unsafe {
-            match GetVolumeInformationW(
-                root,
-                Some(&mut label_buf),
-                None,
-                None,
-                None,
-                None,
-            ) {
-                Ok(()) => wide_to_string(&label_buf),
-                Err(_) => String::new(),
-            }
+        // SAFETY: `wide` (backing `root`) outlives the call; `label_buf` is a
+        // valid 256-wide buffer. Only the FFI call is unsafe — the decode isn't.
+        let volume_info =
+            unsafe { GetVolumeInformationW(root, Some(&mut label_buf), None, None, None, None) };
+        let label = match volume_info {
+            Ok(()) => wide_to_string(&label_buf),
+            Err(_) => String::new(),
         };
 
         let mut total = 0u64;

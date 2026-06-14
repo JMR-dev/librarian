@@ -34,6 +34,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
 
+use crate::com::Apartment;
 use crate::util::to_wide;
 
 /// A decoded icon: tightly-packed, top-down, straight-alpha RGBA8888.
@@ -46,7 +47,7 @@ pub struct IconImage {
 
 /// Generic icon for a file *type*, by lowercase extension (no dot). Does not
 /// touch disk — ideal to cache once per extension.
-pub fn icon_for_extension(ext: &str, large: bool) -> Option<IconImage> {
+pub fn icon_for_extension(_apt: &Apartment, ext: &str, large: bool) -> Option<IconImage> {
     let name = if ext.is_empty() {
         "file".to_string()
     } else {
@@ -56,7 +57,7 @@ pub fn icon_for_extension(ext: &str, large: bool) -> Option<IconImage> {
 }
 
 /// Generic folder icon.
-pub fn folder_icon(large: bool) -> Option<IconImage> {
+pub fn folder_icon(_apt: &Apartment, large: bool) -> Option<IconImage> {
     extract(
         &to_wide("folder"),
         FILE_ATTRIBUTE_DIRECTORY,
@@ -66,7 +67,7 @@ pub fn folder_icon(large: bool) -> Option<IconImage> {
 
 /// The actual icon for a specific path (resolves custom `.exe`/`.lnk`/document
 /// icons). May hit disk; call on the worker thread.
-pub fn icon_for_path(path: &Path, large: bool) -> Option<IconImage> {
+pub fn icon_for_path(_apt: &Apartment, path: &Path, large: bool) -> Option<IconImage> {
     extract(
         &to_wide(&path.to_string_lossy()),
         FILE_ATTRIBUTE_NORMAL,
@@ -232,7 +233,7 @@ mod tests {
     #[test]
     fn extracts_a_generic_text_icon() {
         let icon = worker()
-            .run(|| icon_for_extension("txt", false))
+            .run(|apt| icon_for_extension(apt, "txt", false))
             .expect("txt icon should resolve");
 
         assert!(icon.width > 0 && icon.height > 0);
@@ -244,7 +245,7 @@ mod tests {
     #[test]
     fn extracts_a_folder_icon() {
         let icon = worker()
-            .run(|| folder_icon(false))
+            .run(|apt| folder_icon(apt, false))
             .expect("folder icon should resolve");
         assert_eq!(icon.rgba.len(), (icon.width * icon.height * 4) as usize);
     }
