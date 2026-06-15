@@ -2,9 +2,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
+mod ellipsis;
 mod icons;
 mod rows;
 mod selection;
+mod tree;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -12,22 +14,25 @@ use std::time::{Duration, Instant};
 use iced::keyboard::key::Named;
 use iced::keyboard::{self, Key};
 use iced::widget::{
-    button, checkbox, column, container, image, mouse_area, row, scrollable, stack, text,
-    text_input, Space,
+    button, checkbox, column, container, image, mouse_area, pane_grid, row, scrollable, stack,
+    text, text_input, Space,
 };
 use iced::{Border, Center, Element, Length::Fill, Point, Size, Subscription, Task, Theme};
 
 use librarian_core::{
-    is_visible, read_dir_all, sort_entries, Entry, History, Location, Sort, SortKey, SortOrder,
+    is_visible, read_dir_all, read_subdirs, sort_entries, Entry, History, Location, Sort, SortKey,
+    SortOrder,
 };
 use librarian_win::{
     copy_items, create_folder, delete_to_recycle, known_folders, list_drives, move_items, rename,
     Apartment, DriveInfo, IconImage, KnownFolder, ShellWorker,
 };
 
+use ellipsis::ellipsized;
 use icons::{extract_icons, IconCache, IconKey};
 use rows::{format_time, human_size, Row};
 use selection::Selection;
+use tree::{Reveal, Tree, TreeChild, TreeRow};
 
 /// How close two clicks on the same row must be to count as a double-click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
@@ -45,6 +50,13 @@ const OVERSCAN: usize = 6;
 /// status). Used only to estimate the visible row count before the first real
 /// scroll viewport arrives.
 const CHROME_HEIGHT: f32 = 150.0;
+/// Height of a row in the folder-tree pane. Slightly tighter than the file
+/// list, matching Explorer's denser sidebar.
+const TREE_ROW_HEIGHT: f32 = 22.0;
+/// Horizontal indentation added per tree depth level.
+const TREE_INDENT: f32 = 14.0;
+/// Initial fraction of the window width given to the tree pane.
+const TREE_RATIO: f32 = 0.22;
 
 fn main() -> iced::Result {
     let start = startup_location();
@@ -92,6 +104,14 @@ enum Nav {
     PageDown,
 }
 
+/// Which region a `pane_grid` pane holds: the folder tree (left) or the file
+/// list (right).
+#[derive(Debug, Clone, Copy)]
+enum PaneKind {
+    Tree,
+    List,
+}
+
 /// What the file list is currently showing.
 enum Content {
     ThisPc {
@@ -108,6 +128,13 @@ enum Content {
 struct Librarian {
     worker: ShellWorker,
     history: History,
+    /// The folder navigation tree shown in the left pane.
+    tree: Tree,
+    /// Layout of the tree / file-list split, owning the draggable divider ratio.
+    panes: pane_grid::State<PaneKind>,
+    /// A path the tree is mid-way through revealing (expanding ancestors to);
+    /// re-driven each time an intermediate child load completes.
+    pending_reveal: Option<PathBuf>,
     content: Content,
     /// Precomputed, filtered+sorted display rows for the current `content`.
     rows: Vec<Row>,
@@ -175,6 +202,15 @@ enum Message {
     /// Result of an in-place refresh that preserves selection and scroll.
     Reloaded(u64, Result<Vec<Entry>, String>),
     IconsLoaded(Vec<(IconKey, IconImage)>),
+    // --- navigation tree ---
+    /// Expand/collapse the tree node with this id.
+    TreeToggle(tree::NodeId),
+    /// Navigate the main view to a tree node's location.
+    TreeNavigate(Location),
+    /// Children of tree node `id` finished loading (or failed).
+    TreeChildrenLoaded(tree::NodeId, Result<Vec<TreeChild>, String>),
+    /// The user dragged the divider between the tree and the file list.
+    PaneResized(pane_grid::ResizeEvent),
     // --- file operations ---
     OpenSelected,
     NewFolder,
@@ -191,9 +227,19 @@ enum Message {
 impl Librarian {
     fn new(start: Location) -> (Self, Task<Message>) {
         let settings = config::load();
+        // Two side-by-side panes: the folder tree on the left, file list right.
+        let panes = pane_grid::State::with_configuration(pane_grid::Configuration::Split {
+            axis: pane_grid::Axis::Vertical,
+            ratio: TREE_RATIO,
+            a: Box::new(pane_grid::Configuration::Pane(PaneKind::Tree)),
+            b: Box::new(pane_grid::Configuration::Pane(PaneKind::List)),
+        });
         let mut app = Self {
             worker: ShellWorker::spawn(),
             history: History::new(start),
+            tree: Tree::new(),
+            panes,
+            pending_reveal: None,
             content: Content::ThisPc {
                 drives: Vec::new(),
                 folders: Vec::new(),
@@ -217,9 +263,11 @@ impl Librarian {
             scroll_y: 0.0,
             viewport_h: 720.0 - CHROME_HEIGHT,
         };
-        // Load the starting location and theme the window in parallel.
+        // Load the starting location, populate the tree root (drives + known
+        // folders), and theme the window — all in parallel.
         let load = app.load_current();
-        (app, Task::batch([apply_chrome(), load]))
+        let tree_load = app.load_tree_children(tree::ROOT_ID, Location::ThisPc);
+        (app, Task::batch([apply_chrome(), load, tree_load]))
     }
 
     /// The current persisted-preference snapshot, for writing back to disk.
@@ -372,6 +420,34 @@ impl Librarian {
                 for (key, image) in loaded {
                     self.icons.insert(key, image);
                 }
+            }
+
+            // --- navigation tree -------------------------------------------
+            Message::TreeToggle(id) => {
+                if let Some((load_id, location)) = self.tree.toggle(id) {
+                    return self.load_tree_children(load_id, location);
+                }
+            }
+            Message::TreeNavigate(location) => {
+                self.menu = None;
+                // Re-navigating to where we already are would just churn history.
+                if self.history.current() != &location {
+                    return self.navigate(location);
+                }
+            }
+            Message::TreeChildrenLoaded(id, result) => {
+                // An error becomes an empty (leaf) load so the spinner/chevron
+                // resolves rather than hanging.
+                let children = result.unwrap_or_default();
+                self.tree.set_children(id, children);
+                // A newly-loaded node may let an in-progress reveal continue,
+                // and its rows need icons.
+                let reveal = self.drive_reveal();
+                let icons = self.request_icons();
+                return Task::batch([icons, reveal]);
+            }
+            Message::PaneResized(event) => {
+                self.panes.resize(event.split, event.ratio);
             }
 
             // --- selection, cursor & context menu --------------------------
@@ -533,6 +609,20 @@ impl Librarian {
         let location = self.history.current().clone();
         self.address = address_text(&location);
 
+        // Reveal & highlight the destination in the folder tree, expanding
+        // ancestors as needed (a no-op target for the "This PC" root, which is
+        // already the always-visible tree root).
+        let reveal = match &location {
+            Location::Path(path) => {
+                self.pending_reveal = Some(path.clone());
+                self.drive_reveal()
+            }
+            Location::ThisPc => {
+                self.pending_reveal = None;
+                Task::none()
+            }
+        };
+
         let load = match location {
             Location::ThisPc => {
                 self.content = Content::ThisPc {
@@ -562,7 +652,7 @@ impl Librarian {
             }
         };
         // A fresh listing always starts at the top.
-        Task::batch([self.scroll_to(0.0), load])
+        Task::batch([self.scroll_to(0.0), reveal, load])
     }
 
     fn on_click(&mut self, index: usize) -> Task<Message> {
@@ -740,6 +830,36 @@ impl Librarian {
         Task::perform(offload(move || worker.run(op)), Message::OpFinished)
     }
 
+    // --- navigation tree ------------------------------------------------------
+
+    /// Load the children of a tree node on a worker thread: drives + known
+    /// folders for the "This PC" root, or the subdirectories of a real folder.
+    fn load_tree_children(&self, id: tree::NodeId, location: Location) -> Task<Message> {
+        let worker = self.worker.clone();
+        let show_hidden = self.show_hidden;
+        Task::perform(
+            offload(move || fetch_tree_children(&worker, &location, show_hidden)),
+            move |result| Message::TreeChildrenLoaded(id, result),
+        )
+    }
+
+    /// Advance an in-progress reveal of [`Self::pending_reveal`] by one step:
+    /// expand the next loaded ancestor, request a load if the next one isn't
+    /// loaded yet, or finish (clearing the target) once revealed or unreachable.
+    fn drive_reveal(&mut self) -> Task<Message> {
+        let Some(target) = self.pending_reveal.clone() else {
+            return Task::none();
+        };
+        match self.tree.reveal(&target) {
+            Reveal::Load(id, location) => self.load_tree_children(id, location),
+            Reveal::Wait => Task::none(),
+            Reveal::Stop => {
+                self.pending_reveal = None;
+                Task::none()
+            }
+        }
+    }
+
     /// If a "New folder" we just created is awaiting rename, find it in the
     /// freshly-loaded rows, select it, and drop into the inline rename with its
     /// name selected — mirroring Explorer. Dropped if we've since navigated out
@@ -810,8 +930,11 @@ impl Librarian {
     }
 
     /// Kick off extraction of any icons the current rows need but don't have.
+    /// Covers both the file list and the visible folder-tree nodes, which share
+    /// one icon cache.
     fn request_icons(&mut self) -> Task<Message> {
-        let keys = self.rows.iter().map(|r| r.icon.clone());
+        let mut keys: Vec<IconKey> = self.rows.iter().map(|r| r.icon.clone()).collect();
+        self.tree.collect_icon_keys(&mut keys);
         let needed = self.icons.take_unrequested(keys);
         if needed.is_empty() {
             return Task::none();
@@ -826,17 +949,85 @@ impl Librarian {
     // --- view -----------------------------------------------------------------
 
     fn view(&self) -> Element<'_, Message> {
+        // The folder tree and the file list share a horizontal split with a
+        // draggable divider. Column headers belong only above the file list, so
+        // they live inside the right pane rather than spanning both.
+        let split = pane_grid(&self.panes, |_pane, kind, _maximized| {
+            let content: Element<'_, Message> = match kind {
+                PaneKind::Tree => self.view_tree(),
+                PaneKind::List => {
+                    column![view_header(self.sort), self.view_body()].into()
+                }
+            };
+            pane_grid::Content::new(content)
+        })
+        .spacing(1)
+        .on_resize(8, Message::PaneResized);
+
         let base = column![
             self.view_toolbar(),
             self.view_command_bar(),
-            view_header(self.sort),
-            self.view_body(),
+            split,
             self.view_status(),
         ];
         match &self.menu {
             Some(menu) => stack![base, self.view_context_menu(menu)].into(),
             None => base.into(),
         }
+    }
+
+    /// The folder-tree sidebar: a scrollable, lazily-expanding directory tree.
+    fn view_tree(&self) -> Element<'_, Message> {
+        let rows = self.tree.visible_rows();
+        let mut list = column![].width(Fill);
+        for row in &rows {
+            list = list.push(self.view_tree_row(row));
+        }
+        let scroll = scrollable(list).height(Fill);
+        container(scroll)
+            .width(Fill)
+            .height(Fill)
+            .padding([4, 0])
+            .style(tree_pane_style)
+            .into()
+    }
+
+    fn view_tree_row<'a>(&'a self, data: &TreeRow<'a>) -> Element<'a, Message> {
+        // Indent by depth, then a chevron (or a blank of the same width for
+        // leaves) so labels stay aligned regardless of expandability.
+        let indent = Space::new().width(8.0 + data.depth as f32 * TREE_INDENT);
+        let chevron: Element<'_, Message> = if data.expandable {
+            let glyph = if data.expanded { "▾" } else { "▸" };
+            button(text(glyph.to_string()).size(10))
+                .on_press(Message::TreeToggle(data.id))
+                .padding([0, 4])
+                .style(chevron_button_style)
+                .into()
+        } else {
+            Space::new().width(16.0).into()
+        };
+
+        let icon: Element<'_, Message> = match self.icons.get(data.icon) {
+            Some(handle) => image(handle.clone()).width(16.0).height(16.0).into(),
+            None => Space::new().width(16.0).height(16.0).into(),
+        };
+
+        let selected = self.history.current() == data.location;
+        let label = button(
+            row![icon, ellipsized(data.label.to_string()).size(13).width(Fill)]
+                .spacing(6)
+                .align_y(Center),
+        )
+        .on_press(Message::TreeNavigate(data.location.clone()))
+        .width(Fill)
+        .padding([0, 4])
+        .style(move |theme: &Theme, status| tree_row_button_style(theme, status, selected));
+
+        container(row![indent, chevron, label].spacing(2).align_y(Center))
+            .height(TREE_ROW_HEIGHT)
+            .width(Fill)
+            .align_y(Center)
+            .into()
     }
 
     /// Action buttons for the current selection / directory. Mirrors the
@@ -959,15 +1150,19 @@ impl Librarian {
                 .padding([0, 2])
                 .width(Fill)
                 .into(),
-            _ => text(data.label.clone()).width(Fill).into(),
+            // Truncate over-long cells with an ellipsis rather than wrapping.
+            _ => ellipsized(data.label.clone()).width(Fill).into(),
         };
 
         let line = row![
             icon,
             name,
-            text(modified).width(150.0),
-            text(data.type_label.clone()).width(120.0),
-            text(size).width(90.0),
+            ellipsized(modified).width(150.0),
+            ellipsized(data.type_label.clone()).width(120.0),
+            // Size is numeric, so right-align it (Explorer does the same).
+            ellipsized(size)
+                .width(90.0)
+                .align_x(iced::alignment::Horizontal::Right),
         ]
         .spacing(8)
         .align_y(Center);
@@ -1054,7 +1249,8 @@ impl Librarian {
 }
 
 fn view_header(sort: Sort) -> Element<'static, Message> {
-    let heading = |label: &str, key: SortKey, width: iced::Length| {
+    use iced::alignment::Horizontal;
+    let heading = |label: &str, key: SortKey, width: iced::Length, align: Horizontal| {
         let arrow = if sort.key == key {
             match sort.order {
                 SortOrder::Ascending => " ▲",
@@ -1063,7 +1259,7 @@ fn view_header(sort: Sort) -> Element<'static, Message> {
         } else {
             ""
         };
-        button(text(format!("{label}{arrow}")))
+        button(text(format!("{label}{arrow}")).width(Fill).align_x(align))
             .on_press(Message::SortBy(key))
             .width(width)
             .padding([4, 8])
@@ -1071,10 +1267,11 @@ fn view_header(sort: Sort) -> Element<'static, Message> {
 
     row![
         Space::new().width(16.0),
-        heading("Name", SortKey::Name, Fill),
-        heading("Date modified", SortKey::Modified, 150.0.into()),
-        heading("Type", SortKey::Type, 120.0.into()),
-        heading("Size", SortKey::Size, 90.0.into()),
+        heading("Name", SortKey::Name, Fill, Horizontal::Left),
+        heading("Date modified", SortKey::Modified, 150.0.into(), Horizontal::Left),
+        heading("Type", SortKey::Type, 120.0.into(), Horizontal::Left),
+        // Right-aligned to sit over the right-aligned numeric size values.
+        heading("Size", SortKey::Size, 90.0.into(), Horizontal::Right),
     ]
     .spacing(8)
     .padding([0, 8])
@@ -1096,6 +1293,48 @@ fn row_style(theme: &Theme, selected: bool, lead: bool) -> container::Style {
             width: 1.0,
             radius: 0.0.into(),
         };
+    }
+    style
+}
+
+/// Background of the folder-tree pane — a touch darker than the file list to
+/// set the sidebar apart.
+fn tree_pane_style(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(palette.background.weak.color.into()),
+        ..container::Style::default()
+    }
+}
+
+/// Flat, borderless expand/collapse chevron that only tints on hover.
+fn chevron_button_style(theme: &Theme, status: button::Status) -> button::Style {
+    let palette = theme.extended_palette();
+    let mut style = button::Style {
+        background: None,
+        text_color: palette.background.base.text,
+        ..button::Style::default()
+    };
+    if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+        style.text_color = palette.primary.strong.color;
+    }
+    style
+}
+
+/// A tree-node label button: flat, highlighting on hover and when it points at
+/// the current location.
+fn tree_row_button_style(theme: &Theme, status: button::Status, selected: bool) -> button::Style {
+    let palette = theme.extended_palette();
+    let mut style = button::Style {
+        background: None,
+        text_color: palette.background.base.text,
+        ..button::Style::default()
+    };
+    if selected {
+        style.background = Some(palette.primary.weak.color.into());
+        style.text_color = palette.primary.weak.text;
+    } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+        style.background = Some(palette.background.strong.color.into());
     }
     style
 }
@@ -1142,6 +1381,62 @@ fn address_text(location: &Location) -> String {
     match location {
         Location::ThisPc => "This PC".to_string(),
         Location::Path(path) => path.display().to_string(),
+    }
+}
+
+/// Load the children for a folder-tree node: drives + known folders under the
+/// "This PC" root, or the (visible) subdirectories of a real folder, sorted by
+/// name. Runs on a worker thread via [`offload`].
+fn fetch_tree_children(
+    worker: &ShellWorker,
+    location: &Location,
+    show_hidden: bool,
+) -> Result<Vec<TreeChild>, String> {
+    match location {
+        Location::ThisPc => {
+            let drives = list_drives();
+            let folders = worker.run(|_| known_folders());
+            let children = drives
+                .iter()
+                .map(tree_child_from_drive)
+                .chain(folders.iter().map(tree_child_from_known))
+                .collect();
+            Ok(children)
+        }
+        Location::Path(dir) => {
+            let mut dirs = read_subdirs(dir).map_err(|e| e.to_string())?;
+            dirs.retain(|e| is_visible(e, show_hidden, ""));
+            dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            let children = dirs
+                .into_iter()
+                .map(|e| TreeChild {
+                    label: e.name,
+                    icon: IconKey::Folder,
+                    location: Location::Path(e.path),
+                })
+                .collect();
+            Ok(children)
+        }
+    }
+}
+
+/// A tree child built from a drive, reusing the file-list row mapping so the
+/// label and icon match what the "This PC" listing shows.
+fn tree_child_from_drive(drive: &DriveInfo) -> TreeChild {
+    let row = rows::row_from_drive(drive);
+    TreeChild {
+        label: row.label,
+        icon: row.icon,
+        location: row.target,
+    }
+}
+
+fn tree_child_from_known(folder: &KnownFolder) -> TreeChild {
+    let row = rows::row_from_known(folder);
+    TreeChild {
+        label: row.label,
+        icon: row.icon,
+        location: row.target,
     }
 }
 
