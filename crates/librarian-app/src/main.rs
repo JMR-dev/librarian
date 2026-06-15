@@ -125,6 +125,11 @@ struct Librarian {
     clip: Option<Clip>,
     /// Inline rename in progress, if any.
     renaming: Option<Rename>,
+    /// A folder just created via "New folder", awaiting the inline rename it
+    /// should drop into once it shows up in a reload: `(parent dir, name)`.
+    /// Mirrors Explorer, which creates the folder pre-named and leaves you
+    /// editing the name.
+    pending_rename: Option<(PathBuf, String)>,
     /// Open context menu, if any.
     menu: Option<Menu>,
     /// Last known cursor position, used to anchor the context menu.
@@ -205,6 +210,7 @@ impl Librarian {
             status: String::new(),
             clip: None,
             renaming: None,
+            pending_rename: None,
             menu: None,
             cursor: Point::ORIGIN,
             modifiers: keyboard::Modifiers::default(),
@@ -319,7 +325,9 @@ impl Librarian {
                         };
                         self.recompute_rows();
                         self.status = format!("{} items", self.rows.len());
-                        return self.request_icons();
+                        let icons = self.request_icons();
+                        let rename = self.begin_pending_rename();
+                        return Task::batch([icons, rename]);
                     }
                     Err(error) => {
                         self.status = error.clone();
@@ -353,7 +361,9 @@ impl Librarian {
                     self.recompute_rows();
                     self.restore_selection(&previously);
                     self.status = format!("{} items", self.rows.len());
-                    return self.request_icons();
+                    let icons = self.request_icons();
+                    let rename = self.begin_pending_rename();
+                    return Task::batch([icons, rename]);
                 }
                 // A transient read error during a background refresh leaves the
                 // current view untouched rather than blanking it.
@@ -424,6 +434,9 @@ impl Librarian {
                 self.menu = None;
                 if let Some(dir) = self.current_dir() {
                     let name = unique_folder_name(&dir);
+                    // Remember it so the reload after creation drops us into the
+                    // inline rename, the way Explorer's "New folder" does.
+                    self.pending_rename = Some((dir.clone(), name.clone()));
                     return self
                         .dispatch_op("New folder", move |apt| create_folder(apt, &dir, &name));
                 }
@@ -725,6 +738,31 @@ impl Librarian {
         self.status = format!("{label}…");
         let worker = self.worker.clone();
         Task::perform(offload(move || worker.run(op)), Message::OpFinished)
+    }
+
+    /// If a "New folder" we just created is awaiting rename, find it in the
+    /// freshly-loaded rows, select it, and drop into the inline rename with its
+    /// name selected — mirroring Explorer. Dropped if we've since navigated out
+    /// of the directory it was created in; re-queued if the row hasn't landed in
+    /// this listing yet (a later reload will catch it).
+    fn begin_pending_rename(&mut self) -> Task<Message> {
+        let Some((dir, name)) = self.pending_rename.take() else {
+            return Task::none();
+        };
+        if self.current_dir().as_deref() != Some(dir.as_path()) {
+            return Task::none(); // navigated away; abandon the rename
+        }
+        let Some(index) = self.rows.iter().position(|r| r.label == name) else {
+            self.pending_rename = Some((dir, name));
+            return Task::none();
+        };
+        self.selection.select_one(index);
+        self.renaming = Some(Rename { index, value: name });
+        Task::batch([
+            self.ensure_visible(index),
+            iced::widget::operation::focus(RENAME_ID),
+            iced::widget::operation::select_all(RENAME_ID),
+        ])
     }
 
     // --- derived state --------------------------------------------------------
