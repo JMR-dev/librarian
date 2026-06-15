@@ -57,6 +57,16 @@ const TREE_ROW_HEIGHT: f32 = 22.0;
 const TREE_INDENT: f32 = 14.0;
 /// Initial fraction of the window width given to the tree pane.
 const TREE_RATIO: f32 = 0.22;
+/// Horizontal insets shared by the file-list rows and their column header. A
+/// small left margin keeps the first column off the navigation pane without a
+/// wide gap; the right is larger so the right-aligned Size column gets a little
+/// breathing room from the window edge instead of butting against it.
+const LIST_PAD: iced::Padding = iced::Padding {
+    top: 0.0,
+    right: 16.0,
+    bottom: 0.0,
+    left: 8.0,
+};
 
 fn main() -> iced::Result {
     let start = startup_location();
@@ -953,23 +963,24 @@ impl Librarian {
         // draggable divider. Column headers belong only above the file list, so
         // they live inside the right pane rather than spanning both.
         let split = pane_grid(&self.panes, |_pane, kind, _maximized| {
+            // The command bar lives above the file list (not spanning the tree),
+            // so its buttons align with the list's first column rather than the
+            // navigation pane — and it follows the divider when it's dragged.
             let content: Element<'_, Message> = match kind {
                 PaneKind::Tree => self.view_tree(),
-                PaneKind::List => {
-                    column![view_header(self.sort), self.view_body()].into()
-                }
+                PaneKind::List => column![
+                    self.view_command_bar(),
+                    view_header(self.sort),
+                    self.view_body(),
+                ]
+                .into(),
             };
             pane_grid::Content::new(content)
         })
         .spacing(1)
         .on_resize(8, Message::PaneResized);
 
-        let base = column![
-            self.view_toolbar(),
-            self.view_command_bar(),
-            split,
-            self.view_status(),
-        ];
+        let base = column![self.view_toolbar(), split, self.view_status()];
         match &self.menu {
             Some(menu) => stack![base, self.view_context_menu(menu)].into(),
             None => base.into(),
@@ -1052,7 +1063,13 @@ impl Librarian {
             cmd("Paste", can_paste.then_some(Message::Paste)),
         ]
         .spacing(6)
-        .padding([2, 8])
+        // Keep the button group's left edge locked to the first column.
+        .padding(iced::Padding {
+            top: 2.0,
+            right: 8.0,
+            bottom: 2.0,
+            left: LIST_PAD.left,
+        })
         .align_y(Center)
         .into()
     }
@@ -1170,7 +1187,7 @@ impl Librarian {
         let selected = self.selection.contains(index);
         let lead = self.selection.lead() == Some(index);
         let inner = container(line)
-            .padding([0, 8])
+            .padding(LIST_PAD)
             .height(ROW_HEIGHT)
             .width(Fill)
             .align_y(Center)
@@ -1265,8 +1282,12 @@ fn view_header(sort: Sort) -> Element<'static, Message> {
             .padding([4, 8])
     };
 
+    // No leading icon-gutter space here (unlike the rows): the Name heading
+    // spans the icon column so "Name" sits at the column's true left edge —
+    // over the file icons — instead of leaving a blank strip beside the nav
+    // pane. The Fill Name column absorbs the freed width, so Date/Type/Size
+    // still line up with the rows below.
     row![
-        Space::new().width(16.0),
         heading("Name", SortKey::Name, Fill, Horizontal::Left),
         heading("Date modified", SortKey::Modified, 150.0.into(), Horizontal::Left),
         heading("Type", SortKey::Type, 120.0.into(), Horizontal::Left),
@@ -1274,7 +1295,7 @@ fn view_header(sort: Sort) -> Element<'static, Message> {
         heading("Size", SortKey::Size, 90.0.into(), Horizontal::Right),
     ]
     .spacing(8)
-    .padding([0, 8])
+    .padding(LIST_PAD)
     .align_y(Center)
     .into()
 }
