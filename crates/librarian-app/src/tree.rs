@@ -55,6 +55,45 @@ pub struct TreeChild {
     pub label: String,
     pub icon: IconKey,
     pub location: Location,
+    /// Children to attach immediately. `None` means the node is loaded lazily on
+    /// first expand; `Some` (even empty) means its children are already known
+    /// and grafted along with it — used to nest a curated subtree (e.g. the
+    /// user's folders under their home node) rather than a raw directory listing.
+    pub children: Option<Vec<TreeChild>>,
+    /// Whether the node starts expanded. Only meaningful alongside pre-attached
+    /// [`children`](Self::children); a lazy node can't show children it hasn't
+    /// loaded yet.
+    pub expanded: bool,
+}
+
+impl TreeChild {
+    /// A node whose children are fetched lazily, the first time it's expanded.
+    pub fn lazy(label: String, icon: IconKey, location: Location) -> Self {
+        Self {
+            label,
+            icon,
+            location,
+            children: None,
+            expanded: false,
+        }
+    }
+
+    /// A node grafted with its `children` already attached and shown expanded —
+    /// for a curated, pre-loaded subtree.
+    pub fn branch(
+        label: String,
+        icon: IconKey,
+        location: Location,
+        children: Vec<TreeChild>,
+    ) -> Self {
+        Self {
+            label,
+            icon,
+            location,
+            children: Some(children),
+            expanded: true,
+        }
+    }
 }
 
 /// A flattened, render-ready view of one visible node. Borrows from the tree.
@@ -71,6 +110,7 @@ pub struct TreeRow<'a> {
 }
 
 /// The outcome of a [`Tree::reveal`] step.
+#[derive(Debug)]
 pub enum Reveal {
     /// To continue revealing, the children of this node must be loaded first.
     Load(NodeId, Location),
@@ -82,18 +122,26 @@ pub enum Reveal {
 
 /// The folder tree and its node-id allocator.
 pub struct Tree {
+    /// A hidden synthetic container whose children are the *top-level* nodes
+    /// (the user's folders, then a "This PC" node holding the drives). It is
+    /// never rendered itself — [`visible_rows`](Self::visible_rows) starts at
+    /// its children — which lets the sidebar show a forest of roots rather than
+    /// a single "This PC" parent over everything.
     root: TreeNode,
     next_id: NodeId,
 }
 
 impl Tree {
-    /// A fresh tree whose root is "This PC", expanded and awaiting its child
-    /// load (drives + known folders). The app kicks that load off at startup.
+    /// A fresh tree whose (hidden) root is awaiting its top-level children —
+    /// the user's folders plus a "This PC" node. The app kicks that load off at
+    /// startup; until it lands, the sidebar is empty.
     pub fn new() -> Self {
         let root = TreeNode {
             id: ROOT_ID,
-            label: "This PC".to_string(),
+            label: String::new(),
             icon: IconKey::Folder,
+            // Never navigated or matched against a path; only ever descended
+            // through. `ThisPc` has no path, so it can't collide with a target.
             location: Location::ThisPc,
             expanded: true,
             children: Children::Loading,
@@ -104,17 +152,40 @@ impl Tree {
         }
     }
 
-    /// Flatten the expanded nodes into render rows, depth-first.
+    /// Flatten the expanded nodes into render rows, depth-first. The hidden root
+    /// is skipped, so its children are the top level (depth 0).
     pub fn visible_rows(&self) -> Vec<TreeRow<'_>> {
         let mut rows = Vec::new();
-        push_rows(&self.root, 0, &mut rows);
+        if let Children::Loaded(children) = &self.root.children {
+            for child in children {
+                push_rows(child, 0, &mut rows);
+            }
+        }
         rows
     }
 
     /// Append the icon keys of every visible node, so the app can request them
-    /// from the shared icon cache alongside the main list's.
+    /// from the shared icon cache alongside the main list's. The hidden root has
+    /// no icon of its own, so collection starts at its children.
     pub fn collect_icon_keys(&self, out: &mut Vec<IconKey>) {
-        collect_keys(&self.root, out);
+        if let Children::Loaded(children) = &self.root.children {
+            for child in children {
+                collect_keys(child, out);
+            }
+        }
+    }
+
+    /// The id of the top-level "This PC" node, once the root's children have
+    /// loaded. The app uses it to auto-expand "This PC" at startup so the drives
+    /// are visible without a manual click.
+    pub fn this_pc_id(&self) -> Option<NodeId> {
+        match &self.root.children {
+            Children::Loaded(children) => children
+                .iter()
+                .find(|c| matches!(c.location, Location::ThisPc))
+                .map(|c| c.id),
+            _ => None,
+        }
     }
 
     /// Expand or collapse the node `id`. Returns the node and location to load
@@ -159,13 +230,19 @@ impl Tree {
             .map(|c| {
                 let id = self.next_id;
                 self.next_id += 1;
+                // Pre-attached children are grafted (and recursively built) now;
+                // otherwise the node is left unloaded for a lazy fetch later.
+                let children = match c.children {
+                    Some(kids) => Children::Loaded(self.build_nodes(kids)),
+                    None => Children::Unloaded,
+                };
                 TreeNode {
                     id,
                     label: c.label,
                     icon: c.icon,
                     location: c.location,
-                    expanded: false,
-                    children: Children::Unloaded,
+                    expanded: c.expanded,
+                    children,
                 }
             })
             .collect()
@@ -240,10 +317,22 @@ fn reveal_node(node: &mut TreeNode, target: &Path) -> Reveal {
             Reveal::Load(node.id, node.location.clone())
         }
         Children::Loading => Reveal::Wait,
-        Children::Loaded(children) => match best_child_index(children, target) {
-            Some(i) => reveal_node(&mut children[i], target),
-            None => Reveal::Stop, // target not under any child (hidden, gone, …)
-        },
+        Children::Loaded(children) => {
+            // Prefer the deepest path-prefix child (e.g. a user-folder shortcut).
+            if let Some(i) = best_child_index(children, target) {
+                return reveal_node(&mut children[i], target);
+            }
+            // No path child matched. At the top level the drives live under the
+            // "This PC" node (whose own location is pathless), so fall back to
+            // descending into it — one of its drives will prefix the target.
+            if let Some(i) = children
+                .iter()
+                .position(|c| matches!(c.location, Location::ThisPc))
+            {
+                return reveal_node(&mut children[i], target);
+            }
+            Reveal::Stop // target not under any child (hidden, gone, …)
+        }
     }
 }
 
@@ -266,11 +355,16 @@ mod tests {
     use std::path::PathBuf;
 
     fn child(label: &str, path: &str) -> TreeChild {
-        TreeChild {
-            label: label.to_string(),
-            icon: IconKey::Folder,
-            location: Location::Path(PathBuf::from(path)),
-        }
+        TreeChild::lazy(
+            label.to_string(),
+            IconKey::Folder,
+            Location::Path(PathBuf::from(path)),
+        )
+    }
+
+    /// A pathless "This PC" child — the drives' container at the top level.
+    fn this_pc() -> TreeChild {
+        TreeChild::lazy("This PC".to_string(), IconKey::Folder, Location::ThisPc)
     }
 
     /// Find a visible row by label, for assertions.
@@ -283,22 +377,22 @@ mod tests {
     }
 
     #[test]
-    fn root_is_visible_and_loading() {
+    fn root_is_hidden_until_children_load() {
+        // The synthetic root isn't rendered, so the sidebar is empty until its
+        // top-level children arrive.
         let tree = Tree::new();
-        let rows = tree.visible_rows();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].label, "This PC");
-        assert!(rows[0].expanded);
-        // Loading counts as expandable so the chevron shows immediately.
-        assert!(rows[0].expandable);
+        assert!(tree.visible_rows().is_empty());
     }
 
     #[test]
-    fn set_children_makes_them_visible_under_expanded_root() {
+    fn top_level_children_render_at_depth_zero() {
         let mut tree = Tree::new();
         tree.set_children(ROOT_ID, vec![child("C:", "C:\\"), child("D:", "D:\\")]);
-        let labels: Vec<&str> = tree.visible_rows().iter().map(|r| r.label).collect();
-        assert_eq!(labels, ["This PC", "C:", "D:"]);
+        let rows = tree.visible_rows();
+        // The hidden root contributes no row of its own.
+        let labels: Vec<&str> = rows.iter().map(|r| r.label).collect();
+        assert_eq!(labels, ["C:", "D:"]);
+        assert!(rows.iter().all(|r| r.depth == 0));
     }
 
     #[test]
@@ -320,15 +414,15 @@ mod tests {
         let c = row_id(&tree, "C:");
         tree.toggle(c); // expand C: (its first expansion requests a load)
         tree.set_children(c, vec![child("Users", "C:\\Users")]);
-        assert_eq!(tree.visible_rows().len(), 3); // This PC, C:, Users
+        assert_eq!(tree.visible_rows().len(), 2); // C:, Users
 
         // Collapsing C: hides Users; it requests no reload.
         assert!(tree.toggle(c).is_none());
-        assert_eq!(tree.visible_rows().len(), 2);
+        assert_eq!(tree.visible_rows().len(), 1);
 
         // Re-expanding shows it again with no reload (children cached).
         assert!(tree.toggle(c).is_none());
-        assert_eq!(tree.visible_rows().len(), 3);
+        assert_eq!(tree.visible_rows().len(), 2);
     }
 
     #[test]
@@ -353,11 +447,7 @@ mod tests {
         let c = row_id(&tree, "C:");
         tree.toggle(c); // expand
         tree.set_children(c, Vec::new()); // …discovers it has no subfolders
-        let row = tree
-            .visible_rows()
-            .into_iter()
-            .find(|r| r.id == c)
-            .unwrap();
+        let row = tree.visible_rows().into_iter().find(|r| r.id == c).unwrap();
         assert!(!row.expandable, "a confirmed-empty node shows no chevron");
     }
 
@@ -386,9 +476,9 @@ mod tests {
         tree.set_children(users, vec![child("me", "C:\\Users\\me")]);
         assert!(matches!(tree.reveal(&target), Reveal::Stop));
 
-        // The whole chain is now visible.
+        // The whole chain is now visible (the hidden root adds no row).
         let labels: Vec<&str> = tree.visible_rows().iter().map(|r| r.label).collect();
-        assert_eq!(labels, ["This PC", "C:", "Users", "me", "D:"]);
+        assert_eq!(labels, ["C:", "Users", "me", "D:"]);
     }
 
     #[test]
@@ -423,5 +513,75 @@ mod tests {
             tree.reveal(&PathBuf::from("C:\\Hidden\\x")),
             Reveal::Stop
         ));
+    }
+
+    #[test]
+    fn this_pc_id_finds_the_drives_container() {
+        let mut tree = Tree::new();
+        assert_eq!(tree.this_pc_id(), None, "no node before the roots load");
+        // Top level: a user folder, then the "This PC" node.
+        tree.set_children(
+            ROOT_ID,
+            vec![child("Desktop", "C:\\Users\\me\\Desktop"), this_pc()],
+        );
+        let pc = tree.this_pc_id().expect("This PC node present");
+        assert_eq!(pc, row_id(&tree, "This PC"));
+    }
+
+    #[test]
+    fn reveal_descends_through_this_pc_to_a_drive_path() {
+        // Drives are no longer top-level: they sit under the pathless "This PC"
+        // node, so revealing a drive path must fall back into it.
+        let mut tree = Tree::new();
+        tree.set_children(
+            ROOT_ID,
+            vec![child("Desktop", "C:\\Users\\me\\Desktop"), this_pc()],
+        );
+        let target = PathBuf::from("C:\\Windows");
+
+        // No top-level path child prefixes C:\Windows, so reveal descends into
+        // "This PC" and asks to load it (its drives aren't loaded yet).
+        let pc = tree.this_pc_id().unwrap();
+        match tree.reveal(&target) {
+            Reveal::Load(id, Location::ThisPc) => assert_eq!(id, pc),
+            other => panic!("expected to load the This PC node, got {other:?}"),
+        }
+
+        // Its drives arrive; the next step descends into C:\ toward the target.
+        tree.set_children(pc, vec![child("C:", "C:\\")]);
+        match tree.reveal(&target) {
+            Reveal::Load(_, Location::Path(p)) => assert_eq!(p, PathBuf::from("C:\\")),
+            other => panic!("expected to load C:\\, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn branch_grafts_children_and_starts_expanded() {
+        // A `branch` node arrives with its children already attached and shown,
+        // so they're visible (nested, depth 1) without any lazy load or toggle.
+        let mut tree = Tree::new();
+        let home = TreeChild::branch(
+            "me".to_string(),
+            IconKey::Folder,
+            Location::Path(PathBuf::from("C:\\Users\\me")),
+            vec![
+                child("Desktop", "C:\\Users\\me\\Desktop"),
+                child("Documents", "C:\\Users\\me\\Documents"),
+            ],
+        );
+        tree.set_children(ROOT_ID, vec![home]);
+
+        let rows = tree.visible_rows();
+        let labels: Vec<&str> = rows.iter().map(|r| r.label).collect();
+        assert_eq!(labels, ["me", "Desktop", "Documents"]);
+        // The home node is depth 0 and expanded; its folders are nested at 1.
+        assert_eq!(rows[0].depth, 0);
+        assert!(rows[0].expanded);
+        assert!(rows[1].depth == 1 && rows[2].depth == 1);
+
+        // Collapsing the pre-loaded node requests no reload (children cached).
+        let me = row_id(&tree, "me");
+        assert!(tree.toggle(me).is_none());
+        assert_eq!(tree.visible_rows().len(), 1);
     }
 }

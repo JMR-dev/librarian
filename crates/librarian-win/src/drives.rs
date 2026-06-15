@@ -8,10 +8,10 @@
 
 use std::path::PathBuf;
 
-use windows::core::PCWSTR;
 use windows::Win32::Storage::FileSystem::{
     GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
 };
+use windows::core::PCWSTR;
 
 use crate::util::{to_wide, wide_to_string};
 

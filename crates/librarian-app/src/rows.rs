@@ -61,7 +61,10 @@ pub fn row_from_drive(drive: &DriveInfo) -> Row {
 pub fn row_from_known(folder: &KnownFolder) -> Row {
     Row {
         label: folder.name.to_string(),
-        icon: IconKey::Folder,
+        // Resolve the folder's real shell icon (Desktop/Documents/Downloads/…
+        // each have a distinct one in Explorer), like drives do, instead of the
+        // generic folder glyph.
+        icon: IconKey::Path(folder.path.clone()),
         is_container: true,
         target: Location::Path(folder.path.clone()),
         size: None,
@@ -111,7 +114,9 @@ pub fn human_size(bytes: u64) -> String {
 /// Format a timestamp in local time (e.g. `2026-06-13 09:41`).
 pub fn format_time(time: SystemTime) -> String {
     let utc: DateTime<Utc> = time.into();
-    utc.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string()
+    utc.with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M")
+        .to_string()
 }
 
 #[cfg(test)]

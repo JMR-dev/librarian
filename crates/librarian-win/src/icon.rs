@@ -20,19 +20,20 @@ use core::ffi::c_void;
 use std::mem::size_of;
 use std::path::Path;
 
-use windows::core::PCWSTR;
 use windows::Win32::Graphics::Gdi::{
-    DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO,
-    BITMAPINFOHEADER, DIB_RGB_COLORS, HBITMAP, HGDIOBJ,
+    BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC, GetDIBits,
+    GetObjectW, HBITMAP, HGDIOBJ, ReleaseDC,
 };
 use windows::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_FLAGS_AND_ATTRIBUTES,
 };
+use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{
-    SHGetFileInfoW, SHFILEINFOW, SHGFI_FLAGS, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_SMALLICON,
-    SHGFI_USEFILEATTRIBUTES,
+    FOLDERID_ComputerFolder, SHFILEINFOW, SHGFI_FLAGS, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_PIDL,
+    SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW, SHGetKnownFolderIDList,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
+use windows::core::PCWSTR;
 
 use crate::com::Apartment;
 use crate::util::to_wide;
@@ -53,7 +54,11 @@ pub fn icon_for_extension(_apt: &Apartment, ext: &str, large: bool) -> Option<Ic
     } else {
         format!("file.{ext}")
     };
-    extract(&to_wide(&name), FILE_ATTRIBUTE_NORMAL, icon_flags(large, true))
+    extract(
+        &to_wide(&name),
+        FILE_ATTRIBUTE_NORMAL,
+        icon_flags(large, true),
+    )
 }
 
 /// Generic folder icon.
@@ -75,8 +80,46 @@ pub fn icon_for_path(_apt: &Apartment, path: &Path, large: bool) -> Option<IconI
     )
 }
 
+/// The shell's "This PC" (Computer) icon, matching what Explorer shows for the
+/// machine root. "This PC" is a virtual shell item with no file path, so its
+/// icon is resolved from the Computer folder's id list (PIDL) rather than a path
+/// string. Must run on the COM STA thread.
+pub fn computer_icon(_apt: &Apartment, large: bool) -> Option<IconImage> {
+    let size = if large {
+        SHGFI_LARGEICON
+    } else {
+        SHGFI_SMALLICON
+    };
+    unsafe {
+        // The Computer folder's id list is allocated by the COM task allocator,
+        // so it must be freed with `CoTaskMemFree` once we're done with it.
+        let pidl = SHGetKnownFolderIDList(&FOLDERID_ComputerFolder, 0, None).ok()?;
+        let mut shfi = SHFILEINFOW::default();
+        let ok = SHGetFileInfoW(
+            // With `SHGFI_PIDL` the first argument is a PIDL, not a path string.
+            PCWSTR(pidl as *const u16),
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            Some(&mut shfi),
+            size_of::<SHFILEINFOW>() as u32,
+            SHGFI_ICON | SHGFI_PIDL | size,
+        );
+        CoTaskMemFree(Some(pidl as *const c_void));
+        if ok == 0 || shfi.hIcon.is_invalid() {
+            return None;
+        }
+        let hicon = shfi.hIcon;
+        let image = hicon_to_rgba(hicon);
+        _ = DestroyIcon(hicon);
+        image
+    }
+}
+
 fn icon_flags(large: bool, use_attributes: bool) -> SHGFI_FLAGS {
-    let size = if large { SHGFI_LARGEICON } else { SHGFI_SMALLICON };
+    let size = if large {
+        SHGFI_LARGEICON
+    } else {
+        SHGFI_SMALLICON
+    };
     let mut flags = SHGFI_ICON | size;
     if use_attributes {
         flags |= SHGFI_USEFILEATTRIBUTES;
@@ -248,5 +291,16 @@ mod tests {
             .run(|apt| folder_icon(apt, false))
             .expect("folder icon should resolve");
         assert_eq!(icon.rgba.len(), (icon.width * icon.height * 4) as usize);
+    }
+
+    #[test]
+    fn extracts_the_computer_icon() {
+        let icon = worker()
+            .run(|apt| computer_icon(apt, false))
+            .expect("This PC icon should resolve");
+        assert!(icon.width > 0 && icon.height > 0);
+        assert_eq!(icon.rgba.len(), (icon.width * icon.height * 4) as usize);
+        // A real icon has at least one non-transparent pixel.
+        assert!(icon.rgba.chunks_exact(4).any(|px| px[3] != 0));
     }
 }

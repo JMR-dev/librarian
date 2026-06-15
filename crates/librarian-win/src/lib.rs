@@ -19,8 +19,8 @@ pub mod open;
 
 pub use chrome::apply_window_chrome;
 pub use com::{Apartment, ShellWorker};
-pub use drives::{list_drives, DriveInfo, DriveKind};
+pub use drives::{DriveInfo, DriveKind, list_drives};
 pub use fileop::{copy_items, create_folder, delete_to_recycle, move_items, rename};
-pub use icon::{folder_icon, icon_for_extension, icon_for_path, IconImage};
-pub use known::{known_folders, KnownFolder};
+pub use icon::{IconImage, computer_icon, folder_icon, icon_for_extension, icon_for_path};
+pub use known::{KnownFolder, known_folders, user_home};
 pub use open::open_path;

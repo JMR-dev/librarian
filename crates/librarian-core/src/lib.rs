@@ -11,7 +11,7 @@ pub mod history;
 pub mod model;
 pub mod sort;
 
-pub use enumerate::{read_dir_all, read_dir_batched, read_subdirs, DEFAULT_BATCH};
+pub use enumerate::{DEFAULT_BATCH, read_dir_all, read_dir_batched, read_subdirs};
 pub use history::History;
 pub use model::{Attributes, Entry, EntryKind, Location};
-pub use sort::{is_visible, sort_entries, Sort, SortKey, SortOrder};
+pub use sort::{Sort, SortKey, SortOrder, is_visible, sort_entries};

@@ -15,8 +15,8 @@
 
 use iced::advanced::text::paragraph::Paragraph;
 use iced::advanced::widget::text as text_widget;
-use iced::advanced::widget::{tree, Tree};
-use iced::advanced::{layout, mouse, renderer, text, Layout, Widget};
+use iced::advanced::widget::{Tree, tree};
+use iced::advanced::{Layout, Widget, layout, mouse, renderer, text};
 use iced::{Element, Length, Pixels, Rectangle, Size};
 
 /// Create an ellipsizing single-line text cell with the given content.

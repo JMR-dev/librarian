@@ -14,23 +14,23 @@ use std::time::{Duration, Instant};
 use iced::keyboard::key::Named;
 use iced::keyboard::{self, Key};
 use iced::widget::{
-    button, checkbox, column, container, image, mouse_area, pane_grid, row, scrollable, stack,
-    text, text_input, Space,
+    Space, button, checkbox, column, container, image, mouse_area, pane_grid, row, scrollable,
+    stack, text, text_input,
 };
 use iced::{Border, Center, Element, Length::Fill, Point, Size, Subscription, Task, Theme};
 
 use librarian_core::{
-    is_visible, read_dir_all, read_subdirs, sort_entries, Entry, History, Location, Sort, SortKey,
-    SortOrder,
+    Entry, History, Location, Sort, SortKey, SortOrder, is_visible, read_dir_all, read_subdirs,
+    sort_entries,
 };
 use librarian_win::{
-    copy_items, create_folder, delete_to_recycle, known_folders, list_drives, move_items, rename,
-    Apartment, DriveInfo, IconImage, KnownFolder, ShellWorker,
+    Apartment, DriveInfo, IconImage, KnownFolder, ShellWorker, copy_items, create_folder,
+    delete_to_recycle, known_folders, list_drives, move_items, rename, user_home,
 };
 
 use ellipsis::ellipsized;
-use icons::{extract_icons, IconCache, IconKey};
-use rows::{format_time, human_size, Row};
+use icons::{IconCache, IconKey, extract_icons};
+use rows::{Row, format_time, human_size};
 use selection::Selection;
 use tree::{Reveal, Tree, TreeChild, TreeRow};
 
@@ -78,9 +78,24 @@ fn main() -> iced::Result {
     .title("Librarian")
     .theme(Librarian::theme)
     .subscription(Librarian::subscription)
+    // Set the window icon before `window_size`/`centered`, which preserve the
+    // other window fields they don't touch.
+    .window(iced::window::Settings {
+        icon: window_icon(),
+        ..Default::default()
+    })
     .window_size(Size::new(1100.0, 720.0))
     .centered()
     .run()
+}
+
+/// The window/taskbar icon, embedded at compile time so the executable stays
+/// self-contained and relocatable (no external icon file at runtime). The format
+/// is guessed from the bytes. A decode failure is non-fatal — the app falls back
+/// to the platform default icon rather than failing to launch.
+fn window_icon() -> Option<iced::window::Icon> {
+    let data = include_bytes!("../../../icon/librarian.ico");
+    iced::window::icon::from_file_data(data, None).ok()
 }
 
 /// The cut/copy buffer for in-app clipboard operations.
@@ -125,8 +140,11 @@ enum PaneKind {
 /// What the file list is currently showing.
 enum Content {
     ThisPc {
+        // Only system drives (and, later, mapped network locations) belong in
+        // the "This PC" landing list — not the user's known folders. Those
+        // remain reachable through the navigation tree, which loads them
+        // separately.
         drives: Vec<DriveInfo>,
-        folders: Vec<KnownFolder>,
     },
     Folder {
         entries: Vec<Entry>,
@@ -205,7 +223,7 @@ enum Message {
     MoveSelection(Nav, bool, bool),
     SelectAll,
     Activate,
-    ThisPcLoaded(Vec<DriveInfo>, Vec<KnownFolder>),
+    ThisPcLoaded(Vec<DriveInfo>),
     Loaded(u64, Result<Vec<Entry>, String>),
     /// The current directory changed on disk; re-enumerate it in place.
     DirChanged,
@@ -250,10 +268,7 @@ impl Librarian {
             tree: Tree::new(),
             panes,
             pending_reveal: None,
-            content: Content::ThisPc {
-                drives: Vec::new(),
-                folders: Vec::new(),
-            },
+            content: Content::ThisPc { drives: Vec::new() },
             rows: Vec::new(),
             sort: settings.sort,
             show_hidden: settings.show_hidden,
@@ -273,10 +288,10 @@ impl Librarian {
             scroll_y: 0.0,
             viewport_h: 720.0 - CHROME_HEIGHT,
         };
-        // Load the starting location, populate the tree root (drives + known
-        // folders), and theme the window — all in parallel.
+        // Load the starting location, populate the tree's top level (the user's
+        // folders + a "This PC" node), and theme the window — all in parallel.
         let load = app.load_current();
-        let tree_load = app.load_tree_children(tree::ROOT_ID, Location::ThisPc);
+        let tree_load = app.load_tree_roots();
         (app, Task::batch([apply_chrome(), load, tree_load]))
     }
 
@@ -365,8 +380,8 @@ impl Librarian {
                 config::save(&self.settings());
             }
             Message::RowClicked(index) => return self.on_click(index),
-            Message::ThisPcLoaded(drives, folders) => {
-                self.content = Content::ThisPc { drives, folders };
+            Message::ThisPcLoaded(drives) => {
+                self.content = Content::ThisPc { drives };
                 self.recompute_rows();
                 self.status = format!("{} items", self.rows.len());
                 return self.request_icons();
@@ -450,11 +465,22 @@ impl Librarian {
                 // resolves rather than hanging.
                 let children = result.unwrap_or_default();
                 self.tree.set_children(id, children);
+                // When the top level lands, auto-expand "This PC" so the drives
+                // show without a manual click (it starts collapsed otherwise).
+                let expand_pc = if id == tree::ROOT_ID {
+                    self.tree
+                        .this_pc_id()
+                        .and_then(|pc| self.tree.toggle(pc))
+                        .map(|(load_id, location)| self.load_tree_children(load_id, location))
+                        .unwrap_or_else(Task::none)
+                } else {
+                    Task::none()
+                };
                 // A newly-loaded node may let an in-progress reveal continue,
                 // and its rows need icons.
                 let reveal = self.drive_reveal();
                 let icons = self.request_icons();
-                return Task::batch([icons, reveal]);
+                return Task::batch([icons, expand_pc, reveal]);
             }
             Message::PaneResized(event) => {
                 self.panes.resize(event.split, event.ratio);
@@ -635,16 +661,9 @@ impl Librarian {
 
         let load = match location {
             Location::ThisPc => {
-                self.content = Content::ThisPc {
-                    drives: Vec::new(),
-                    folders: Vec::new(),
-                };
+                self.content = Content::ThisPc { drives: Vec::new() };
                 self.rows.clear();
-                let worker = self.worker.clone();
-                Task::perform(
-                    offload(move || (list_drives(), worker.run(|_| known_folders()))),
-                    |(drives, folders)| Message::ThisPcLoaded(drives, folders),
-                )
+                Task::perform(offload(list_drives), Message::ThisPcLoaded)
             }
             Location::Path(path) => {
                 self.load_token += 1;
@@ -756,12 +775,15 @@ impl Librarian {
         if paths.is_empty() {
             return;
         }
-        let wanted: std::collections::HashSet<&Path> =
-            paths.iter().map(PathBuf::as_path).collect();
-        let indices = self.rows.iter().enumerate().filter_map(|(i, row)| match &row.target {
-            Location::Path(path) if wanted.contains(path.as_path()) => Some(i),
-            _ => None,
-        });
+        let wanted: std::collections::HashSet<&Path> = paths.iter().map(PathBuf::as_path).collect();
+        let indices = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, row)| match &row.target {
+                Location::Path(path) if wanted.contains(path.as_path()) => Some(i),
+                _ => None,
+            });
         self.selection.set_many(indices);
     }
 
@@ -824,7 +846,10 @@ impl Librarian {
         self.scroll_y = y;
         iced::widget::operation::scroll_to(
             LIST_ID,
-            scrollable::AbsoluteOffset { x: None, y: Some(y) },
+            scrollable::AbsoluteOffset {
+                x: None,
+                y: Some(y),
+            },
         )
     }
 
@@ -842,13 +867,22 @@ impl Librarian {
 
     // --- navigation tree ------------------------------------------------------
 
-    /// Load the children of a tree node on a worker thread: drives + known
-    /// folders for the "This PC" root, or the subdirectories of a real folder.
-    fn load_tree_children(&self, id: tree::NodeId, location: Location) -> Task<Message> {
+    /// Load the tree's top-level nodes (the user's folders + a "This PC" node)
+    /// onto the hidden root, on a worker thread.
+    fn load_tree_roots(&self) -> Task<Message> {
         let worker = self.worker.clone();
+        Task::perform(
+            offload(move || Ok(fetch_tree_roots(&worker))),
+            move |result| Message::TreeChildrenLoaded(tree::ROOT_ID, result),
+        )
+    }
+
+    /// Load the children of a tree node on a worker thread: the drives for the
+    /// "This PC" node, or the subdirectories of a real folder.
+    fn load_tree_children(&self, id: tree::NodeId, location: Location) -> Task<Message> {
         let show_hidden = self.show_hidden;
         Task::perform(
-            offload(move || fetch_tree_children(&worker, &location, show_hidden)),
+            offload(move || fetch_tree_children(&location, show_hidden)),
             move |result| Message::TreeChildrenLoaded(id, result),
         )
     }
@@ -912,12 +946,8 @@ impl Librarian {
     /// Rebuild `rows` from `content`, applying the current filter and sort.
     fn recompute_rows(&mut self) {
         self.rows = match &self.content {
-            Content::ThisPc { drives, folders } => {
-                let mut rows: Vec<Row> = drives
-                    .iter()
-                    .map(rows::row_from_drive)
-                    .chain(folders.iter().map(rows::row_from_known))
-                    .collect();
+            Content::ThisPc { drives } => {
+                let mut rows: Vec<Row> = drives.iter().map(rows::row_from_drive).collect();
                 if !self.filter.is_empty() {
                     let needle = self.filter.to_lowercase();
                     rows.retain(|r| r.label.to_lowercase().contains(&needle));
@@ -991,7 +1021,13 @@ impl Librarian {
     fn view_tree(&self) -> Element<'_, Message> {
         let rows = self.tree.visible_rows();
         let mut list = column![].width(Fill);
-        for row in &rows {
+        for (i, row) in rows.iter().enumerate() {
+            // Separate the user's folders (above) from the "This PC" drives
+            // section (below) with a divider. Skip it when "This PC" is the very
+            // first row, so we never lead with a stray rule.
+            if i > 0 && matches!(row.location, Location::ThisPc) {
+                list = list.push(tree_section_divider());
+            }
             list = list.push(self.view_tree_row(row));
         }
         let scroll = scrollable(list).height(Fill);
@@ -1025,9 +1061,12 @@ impl Librarian {
 
         let selected = self.history.current() == data.location;
         let label = button(
-            row![icon, ellipsized(data.label.to_string()).size(13).width(Fill)]
-                .spacing(6)
-                .align_y(Center),
+            row![
+                icon,
+                ellipsized(data.label.to_string()).size(13).width(Fill)
+            ]
+            .spacing(6)
+            .align_y(Center),
         )
         .on_press(Message::TreeNavigate(data.location.clone()))
         .width(Fill)
@@ -1093,7 +1132,10 @@ impl Librarian {
         };
         row![
             nav("←", self.history.can_go_back().then_some(Message::GoBack)),
-            nav("→", self.history.can_go_forward().then_some(Message::GoForward)),
+            nav(
+                "→",
+                self.history.can_go_forward().then_some(Message::GoForward)
+            ),
             nav("↑", self.history.current().parent().map(|_| Message::GoUp)),
             nav("⟳", Some(Message::Refresh)),
             text_input("Path", &self.address)
@@ -1289,7 +1331,12 @@ fn view_header(sort: Sort) -> Element<'static, Message> {
     // still line up with the rows below.
     row![
         heading("Name", SortKey::Name, Fill, Horizontal::Left),
-        heading("Date modified", SortKey::Modified, 150.0.into(), Horizontal::Left),
+        heading(
+            "Date modified",
+            SortKey::Modified,
+            150.0.into(),
+            Horizontal::Left
+        ),
         heading("Type", SortKey::Type, 120.0.into(), Horizontal::Left),
         // Right-aligned to sit over the right-aligned numeric size values.
         heading("Size", SortKey::Size, 90.0.into(), Horizontal::Right),
@@ -1360,6 +1407,26 @@ fn tree_row_button_style(theme: &Theme, status: button::Status, selected: bool) 
     style
 }
 
+/// A thin horizontal divider between the folder tree's sections (the user's
+/// folders above, the "This PC" drives section below). Inset from the pane edges
+/// so it reads as a subtle separator rather than a hard border.
+fn tree_section_divider() -> Element<'static, Message> {
+    let line =
+        container(Space::new().width(Fill).height(1.0)).style(|theme: &Theme| container::Style {
+            background: Some(theme.extended_palette().background.strong.color.into()),
+            ..container::Style::default()
+        });
+    container(line)
+        .padding(iced::Padding {
+            top: 4.0,
+            right: 10.0,
+            bottom: 4.0,
+            left: 10.0,
+        })
+        .width(Fill)
+        .into()
+}
+
 /// One clickable row in the context menu.
 fn menu_item(label: &str, message: Message) -> Element<'static, Message> {
     button(text(label.to_string()).size(13))
@@ -1405,60 +1472,78 @@ fn address_text(location: &Location) -> String {
     }
 }
 
-/// Load the children for a folder-tree node: drives + known folders under the
-/// "This PC" root, or the (visible) subdirectories of a real folder, sorted by
-/// name. Runs on a worker thread via [`offload`].
-fn fetch_tree_children(
-    worker: &ShellWorker,
-    location: &Location,
-    show_hidden: bool,
-) -> Result<Vec<TreeChild>, String> {
+/// The top-level nodes of the folder tree: the user's home folder (with the
+/// known user folders nested inside, shown expanded), then a "This PC" node that
+/// holds the drives. Mirrors Windows 11's nav pane.
+fn fetch_tree_roots(worker: &ShellWorker) -> Vec<TreeChild> {
+    let folders = worker.run(|_| known_folders());
+    let home = worker.run(|_| user_home());
+    let known: Vec<TreeChild> = folders.iter().map(tree_child_from_known).collect();
+
+    let mut roots = Vec::new();
+    match home {
+        Some(home) => roots.push(home_tree_child(home, known)),
+        // If the home folder can't be resolved, list the known folders at the
+        // top level rather than dropping them entirely.
+        None => roots.extend(known),
+    }
+    roots.push(this_pc_tree_child());
+    roots
+}
+
+/// The user's home-folder node, labelled with the home folder's name (the
+/// account folder, e.g. `Alice`) and carrying the known user folders nested
+/// inside, shown expanded. Uses the home folder's real shell icon.
+fn home_tree_child(home: PathBuf, folders: Vec<TreeChild>) -> TreeChild {
+    let label = home
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Home".to_string());
+    TreeChild::branch(
+        label,
+        IconKey::Path(home.clone()),
+        Location::Path(home),
+        folders,
+    )
+}
+
+/// Load the children for a folder-tree node: the drives under the "This PC"
+/// node, or the (visible) subdirectories of a real folder, sorted by name. Runs
+/// on a worker thread via [`offload`]. (Neither path needs the COM worker — the
+/// top-level known folders that do are loaded by [`fetch_tree_roots`].)
+fn fetch_tree_children(location: &Location, show_hidden: bool) -> Result<Vec<TreeChild>, String> {
     match location {
-        Location::ThisPc => {
-            let drives = list_drives();
-            let folders = worker.run(|_| known_folders());
-            let children = drives
-                .iter()
-                .map(tree_child_from_drive)
-                .chain(folders.iter().map(tree_child_from_known))
-                .collect();
-            Ok(children)
-        }
+        // "This PC" now contains only the system drives; the user's folders are
+        // their own top-level nodes (see [`fetch_tree_roots`]).
+        Location::ThisPc => Ok(list_drives().iter().map(tree_child_from_drive).collect()),
         Location::Path(dir) => {
             let mut dirs = read_subdirs(dir).map_err(|e| e.to_string())?;
             dirs.retain(|e| is_visible(e, show_hidden, ""));
             dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
             let children = dirs
                 .into_iter()
-                .map(|e| TreeChild {
-                    label: e.name,
-                    icon: IconKey::Folder,
-                    location: Location::Path(e.path),
-                })
+                .map(|e| TreeChild::lazy(e.name, IconKey::Folder, Location::Path(e.path)))
                 .collect();
             Ok(children)
         }
     }
 }
 
+/// The standalone "This PC" tree node — an expandable container for the drives.
+fn this_pc_tree_child() -> TreeChild {
+    TreeChild::lazy("This PC".to_string(), IconKey::Computer, Location::ThisPc)
+}
+
 /// A tree child built from a drive, reusing the file-list row mapping so the
 /// label and icon match what the "This PC" listing shows.
 fn tree_child_from_drive(drive: &DriveInfo) -> TreeChild {
     let row = rows::row_from_drive(drive);
-    TreeChild {
-        label: row.label,
-        icon: row.icon,
-        location: row.target,
-    }
+    TreeChild::lazy(row.label, row.icon, row.target)
 }
 
 fn tree_child_from_known(folder: &KnownFolder) -> TreeChild {
     let row = rows::row_from_known(folder);
-    TreeChild {
-        label: row.label,
-        icon: row.icon,
-        location: row.target,
-    }
+    TreeChild::lazy(row.label, row.icon, row.target)
 }
 
 /// A non-colliding "New folder" name in `dir`, matching Explorer's scheme.
@@ -1509,11 +1594,7 @@ fn key_to_message(key: Key, modifiers: keyboard::Modifiers) -> Option<Message> {
 
 /// `""` for a count of 1, `"s"` otherwise — for pluralizing status text.
 fn plural(count: usize) -> &'static str {
-    if count == 1 {
-        ""
-    } else {
-        "s"
-    }
+    if count == 1 { "" } else { "s" }
 }
 
 /// A stream that emits [`Message::DirChanged`] whenever `path`'s direct
@@ -1529,42 +1610,45 @@ fn plural(count: usize) -> &'static str {
 #[allow(clippy::ptr_arg)]
 fn watch_stream(path: &PathBuf) -> impl iced::futures::Stream<Item = Message> + use<> {
     use iced::futures::{SinkExt, StreamExt};
-    use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode, DebounceEventResult};
+    use notify_debouncer_mini::{DebounceEventResult, new_debouncer, notify::RecursiveMode};
 
     let path = path.clone();
-    iced::stream::channel(4, move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
-        // The debouncer callback (sync, on notify's thread) pokes this channel;
-        // the async loop below drains it and forwards to the UI.
-        let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<()>(4);
+    iced::stream::channel(
+        4,
+        move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+            // The debouncer callback (sync, on notify's thread) pokes this channel;
+            // the async loop below drains it and forwards to the UI.
+            let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<()>(4);
 
-        let mut debouncer = match new_debouncer(
-            Duration::from_millis(200),
-            move |res: DebounceEventResult| {
-                // Any non-empty batch of events means the directory changed.
-                if res.map(|events| !events.is_empty()).unwrap_or(false) {
-                    let _ = tx.try_send(());
-                }
-            },
-        ) {
-            Ok(debouncer) => debouncer,
-            Err(_) => return,
-        };
+            let mut debouncer = match new_debouncer(
+                Duration::from_millis(200),
+                move |res: DebounceEventResult| {
+                    // Any non-empty batch of events means the directory changed.
+                    if res.map(|events| !events.is_empty()).unwrap_or(false) {
+                        let _ = tx.try_send(());
+                    }
+                },
+            ) {
+                Ok(debouncer) => debouncer,
+                Err(_) => return,
+            };
 
-        if debouncer
-            .watcher()
-            .watch(&path, RecursiveMode::NonRecursive)
-            .is_err()
-        {
-            return;
-        }
-
-        while rx.next().await.is_some() {
-            if output.send(Message::DirChanged).await.is_err() {
-                break; // the app dropped this subscription
+            if debouncer
+                .watcher()
+                .watch(&path, RecursiveMode::NonRecursive)
+                .is_err()
+            {
+                return;
             }
-        }
-        // `debouncer` drops here, stopping its background watcher thread.
-    })
+
+            while rx.next().await.is_some() {
+                if output.send(Message::DirChanged).await.is_err() {
+                    break; // the app dropped this subscription
+                }
+            }
+            // `debouncer` drops here, stopping its background watcher thread.
+        },
+    )
 }
 
 /// Apply the dark title bar / Mica backdrop to the main window once it exists.
@@ -1614,7 +1698,10 @@ fn visible_window(scroll_y: f32, viewport_h: f32, total: usize) -> (usize, usize
     let first = (scroll_y.max(0.0) / ROW_HEIGHT).floor() as usize;
     let onscreen = (viewport_h.max(0.0) / ROW_HEIGHT).ceil() as usize + 1;
     let start = first.saturating_sub(OVERSCAN);
-    let end = first.saturating_add(onscreen).saturating_add(OVERSCAN).min(total);
+    let end = first
+        .saturating_add(onscreen)
+        .saturating_add(OVERSCAN)
+        .min(total);
     (start, end)
 }
 
@@ -1655,6 +1742,13 @@ where
 mod tests {
     use super::*;
 
+    #[test]
+    fn embedded_window_icon_decodes() {
+        // The bundled .ico must actually decode (right path + ICO codec enabled),
+        // otherwise the window would silently fall back to the default icon.
+        assert!(window_icon().is_some(), "bundled window icon should decode");
+    }
+
     fn ctrl() -> keyboard::Modifiers {
         keyboard::Modifiers::CTRL
     }
@@ -1677,7 +1771,10 @@ mod tests {
             key_to_message(ch("c"), ctrl()),
             Some(Message::Copy)
         ));
-        assert!(matches!(key_to_message(ch("x"), ctrl()), Some(Message::Cut)));
+        assert!(matches!(
+            key_to_message(ch("x"), ctrl()),
+            Some(Message::Cut)
+        ));
         assert!(matches!(
             key_to_message(ch("v"), ctrl()),
             Some(Message::Paste)

@@ -8,12 +8,12 @@
 use core::ffi::c_void;
 use std::path::PathBuf;
 
-use windows::core::GUID;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{
-    SHGetKnownFolderPath, FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads,
-    FOLDERID_Music, FOLDERID_Pictures, FOLDERID_Videos, KNOWN_FOLDER_FLAG,
+    FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Music, FOLDERID_Pictures,
+    FOLDERID_Profile, FOLDERID_Videos, KNOWN_FOLDER_FLAG, SHGetKnownFolderPath,
 };
+use windows::core::GUID;
 
 #[derive(Debug, Clone)]
 pub struct KnownFolder {
@@ -40,6 +40,12 @@ pub fn known_folders() -> Vec<KnownFolder> {
         }
     }
     folders
+}
+
+/// The current user's home (profile) folder, e.g. `C:\Users\Alice`. Backs the
+/// folder tree's home node, under which the known user folders are nested.
+pub fn user_home() -> Option<PathBuf> {
+    resolve(&FOLDERID_Profile)
 }
 
 fn resolve(id: &GUID) -> Option<PathBuf> {

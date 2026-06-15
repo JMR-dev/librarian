@@ -13,13 +13,13 @@
 
 use std::path::{Path, PathBuf};
 
-use windows::core::PCWSTR;
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
-use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
 use windows::Win32::UI::Shell::{
-    FileOperation, IFileOperation, IShellItem, SHCreateItemFromParsingName, FILEOPERATION_FLAGS,
-    FOF_ALLOWUNDO, FOF_NOCONFIRMMKDIR, FOFX_RECYCLEONDELETE,
+    FILEOPERATION_FLAGS, FOF_ALLOWUNDO, FOF_NOCONFIRMMKDIR, FOFX_RECYCLEONDELETE, FileOperation,
+    IFileOperation, IShellItem, SHCreateItemFromParsingName,
 };
+use windows::core::PCWSTR;
 
 use crate::com::Apartment;
 use crate::util::to_wide;

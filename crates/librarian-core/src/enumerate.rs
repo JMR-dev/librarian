@@ -97,7 +97,9 @@ pub fn read_subdirs(dir: &Path) -> io::Result<Vec<Entry>> {
     let mut dirs = Vec::new();
     for dirent in fs::read_dir(dir)? {
         let Ok(dirent) = dirent else { continue };
-        let Ok(meta) = dirent.metadata() else { continue };
+        let Ok(meta) = dirent.metadata() else {
+            continue;
+        };
         if !meta.is_dir() {
             continue;
         }

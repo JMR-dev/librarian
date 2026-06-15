@@ -2,9 +2,9 @@
 
 use std::path::Path;
 
-use windows::core::{w, PCWSTR};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows::core::{PCWSTR, w};
 
 use crate::com::Apartment;
 use crate::util::to_wide;
