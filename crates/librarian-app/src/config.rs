@@ -16,15 +16,18 @@ use std::path::PathBuf;
 
 use librarian_core::{Sort, SortKey, SortOrder};
 
+use crate::ViewMode;
+
 const FILE_NAME: &str = "librarian.config";
 const APP_DIR: &str = "Librarian";
 
 /// The persisted, user-facing view preferences. Defaults match a fresh install:
-/// hidden items off, name-ascending sort.
+/// hidden items off, name-ascending sort, details view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Settings {
     pub show_hidden: bool,
     pub sort: Sort,
+    pub view_mode: ViewMode,
 }
 
 /// Load saved settings, falling back to defaults if none are stored or the file
@@ -76,10 +79,11 @@ fn roaming_path() -> Option<PathBuf> {
 
 fn serialize(settings: &Settings) -> String {
     format!(
-        "show_hidden={}\nsort_key={}\nsort_order={}\n",
+        "show_hidden={}\nsort_key={}\nsort_order={}\nview_mode={}\n",
         settings.show_hidden,
         sort_key_str(settings.sort.key),
         sort_order_str(settings.sort.order),
+        view_mode_str(settings.view_mode),
     )
 }
 
@@ -100,6 +104,11 @@ fn parse(text: &str) -> Settings {
             "sort_order" => {
                 if let Some(order) = sort_order_from(value) {
                     settings.sort.order = order;
+                }
+            }
+            "view_mode" => {
+                if let Some(mode) = view_mode_from(value) {
+                    settings.view_mode = mode;
                 }
             }
             _ => {}
@@ -142,6 +151,29 @@ fn sort_order_from(value: &str) -> Option<SortOrder> {
     }
 }
 
+fn view_mode_str(mode: ViewMode) -> &'static str {
+    match mode {
+        ViewMode::Details => "details",
+        ViewMode::Tiny => "tiny",
+        ViewMode::Small => "small",
+        ViewMode::Medium => "medium",
+        ViewMode::Large => "large",
+        ViewMode::ExtraLarge => "xlarge",
+    }
+}
+
+fn view_mode_from(value: &str) -> Option<ViewMode> {
+    match value {
+        "details" => Some(ViewMode::Details),
+        "tiny" => Some(ViewMode::Tiny),
+        "small" => Some(ViewMode::Small),
+        "medium" => Some(ViewMode::Medium),
+        "large" => Some(ViewMode::Large),
+        "xlarge" => Some(ViewMode::ExtraLarge),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +187,7 @@ mod tests {
                 order: SortOrder::Descending,
                 ..Sort::default()
             },
+            view_mode: ViewMode::ExtraLarge,
         };
         assert_eq!(parse(&serialize(&settings)), settings);
     }

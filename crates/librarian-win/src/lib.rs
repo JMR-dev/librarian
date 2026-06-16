@@ -21,6 +21,8 @@ pub use chrome::apply_window_chrome;
 pub use com::{Apartment, ShellWorker};
 pub use drives::{DriveInfo, DriveKind, list_drives};
 pub use fileop::{copy_items, create_folder, delete_to_recycle, move_items, rename};
-pub use icon::{IconImage, computer_icon, folder_icon, icon_for_extension, icon_for_path};
+pub use icon::{
+    IconImage, computer_icon, folder_icon, icon_for_extension, icon_for_path, thumbnail,
+};
 pub use known::{KnownFolder, known_folders, user_home};
 pub use open::open_path;

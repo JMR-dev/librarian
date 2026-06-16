@@ -6,6 +6,7 @@ mod ellipsis;
 mod icons;
 mod rows;
 mod selection;
+mod thumbs;
 mod tree;
 
 use std::path::{Path, PathBuf};
@@ -14,8 +15,8 @@ use std::time::{Duration, Instant};
 use iced::keyboard::key::Named;
 use iced::keyboard::{self, Key};
 use iced::widget::{
-    Space, button, checkbox, column, container, image, mouse_area, pane_grid, row, scrollable,
-    stack, text, text_input,
+    Space, button, checkbox, column, container, image, mouse_area, pane_grid, pick_list,
+    responsive, row, scrollable, stack, text, text_input,
 };
 use iced::{Border, Center, Element, Length::Fill, Point, Size, Subscription, Task, Theme};
 
@@ -32,6 +33,7 @@ use ellipsis::ellipsized;
 use icons::{IconCache, IconKey, extract_icons};
 use rows::{Row, format_time, human_size};
 use selection::Selection;
+use thumbs::{CacheSweep, ThumbCache, ThumbKey, extract_cached, extract_full};
 use tree::{Reveal, Tree, TreeChild, TreeRow};
 
 /// How close two clicks on the same row must be to count as a double-click.
@@ -40,6 +42,9 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 const RENAME_ID: &str = "librarian-rename";
 /// Widget id of the scrollable file list, so we can keep selection in view.
 const LIST_ID: &str = "librarian-list";
+/// A widget id that intentionally matches nothing, used to clear focus (focusing
+/// it unfocuses every real widget). Must not collide with any actual widget id.
+const BLUR_ID: &str = "librarian-blur";
 /// Fixed height of each file row. Making rows uniform lets keyboard navigation
 /// compute scroll offsets exactly without measuring the rendered list.
 const ROW_HEIGHT: f32 = 24.0;
@@ -67,6 +72,33 @@ const LIST_PAD: iced::Padding = iced::Padding {
     bottom: 0.0,
     left: 8.0,
 };
+/// Padding inside each icon-grid tile (around the thumbnail + label block).
+const TILE_PAD: f32 = 8.0;
+/// Vertical gap between a tile's thumbnail and its label.
+const TILE_GAP: f32 = 4.0;
+/// Height reserved for a tile's single-line label (text size 12).
+const LABEL_LINE_H: f32 = 16.0;
+/// Minimum tile content width, so labels under small thumbnails still have room.
+const MIN_TILE_INNER_W: f32 = 76.0;
+/// Horizontal inset of the whole icon grid from the pane edges.
+const GRID_PAD: f32 = 8.0;
+/// Extra tile-rows rendered above/below the viewport in grid mode (cf. OVERSCAN).
+const GRID_OVERSCAN_ROWS: usize = 2;
+/// Width we assume the vertical scrollbar steals from the grid's content area,
+/// so column count is computed against the space tiles actually get.
+const SCROLLBAR_ALLOWANCE: f32 = 14.0;
+/// How many thumbnails the background pre-cache warms per task. Chunked so a big
+/// folder streams in (and the worker stays interruptible) rather than blocking on
+/// one giant extraction.
+const BG_CHUNK: usize = 24;
+/// Upper bound on how many thumbnails the background pre-cache will warm for one
+/// folder, so a pathologically large directory can't pin the thumbnail worker
+/// indefinitely. Beyond this, off-screen tiles load on demand as you scroll.
+const MAX_BACKGROUND_PRECACHE: usize = 4000;
+/// Frames of the loading "wait circle" — a rotating half-filled disc.
+const SPINNER_FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
+/// How often the loading spinner advances a frame.
+const SPINNER_TICK: Duration = Duration::from_millis(120);
 
 fn main() -> iced::Result {
     let start = startup_location();
@@ -137,6 +169,67 @@ enum PaneKind {
     List,
 }
 
+/// How the file list renders. `Details` is the columnar list; the other modes
+/// are wrapped icon grids at increasing thumbnail sizes. The pixel sizes match
+/// Windows' native thumbnail-cache buckets (16/32/48/96/256) so each request
+/// hits the OS cache rather than forcing a re-rasterization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ViewMode {
+    #[default]
+    Details,
+    Tiny,
+    Small,
+    Medium,
+    Large,
+    ExtraLarge,
+}
+
+impl ViewMode {
+    /// Every selectable mode, in the order the view picker lists them.
+    const ALL: [ViewMode; 6] = [
+        ViewMode::Details,
+        ViewMode::Tiny,
+        ViewMode::Small,
+        ViewMode::Medium,
+        ViewMode::Large,
+        ViewMode::ExtraLarge,
+    ];
+
+    /// Thumbnail edge length in pixels for the grid modes; `None` for `Details`.
+    fn thumb_px(self) -> Option<u16> {
+        match self {
+            ViewMode::Details => None,
+            ViewMode::Tiny => Some(16),
+            ViewMode::Small => Some(32),
+            ViewMode::Medium => Some(48),
+            ViewMode::Large => Some(96),
+            ViewMode::ExtraLarge => Some(256),
+        }
+    }
+
+    /// One grid tile's footprint, `(width, height)` in pixels: the thumbnail box
+    /// plus a single-line label, with uniform padding. Meaningless for `Details`.
+    fn tile_size(self) -> (f32, f32) {
+        let px = self.thumb_px().unwrap_or(16) as f32;
+        let inner_w = px.max(MIN_TILE_INNER_W);
+        let inner_h = px + TILE_GAP + LABEL_LINE_H;
+        (inner_w + TILE_PAD * 2.0, inner_h + TILE_PAD * 2.0)
+    }
+}
+
+impl std::fmt::Display for ViewMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ViewMode::Details => "Details",
+            ViewMode::Tiny => "Tiny icons",
+            ViewMode::Small => "Small icons",
+            ViewMode::Medium => "Medium icons",
+            ViewMode::Large => "Large icons",
+            ViewMode::ExtraLarge => "Extra large icons",
+        })
+    }
+}
+
 /// What the file list is currently showing.
 enum Content {
     ThisPc {
@@ -154,7 +247,11 @@ enum Content {
 }
 
 struct Librarian {
+    /// The interactive COM worker: icons, file operations, drive queries, open.
     worker: ShellWorker,
+    /// A second, dedicated COM STA worker used *only* for thumbnail extraction,
+    /// so a slow `GetImage` decode can't stall the interactive `worker`.
+    thumb_worker: ShellWorker,
     history: History,
     /// The folder navigation tree shown in the left pane.
     tree: Tree,
@@ -167,11 +264,16 @@ struct Librarian {
     /// Precomputed, filtered+sorted display rows for the current `content`.
     rows: Vec<Row>,
     sort: Sort,
+    /// Details list vs. one of the icon-grid sizes.
+    view_mode: ViewMode,
     show_hidden: bool,
     filter: String,
     address: String,
     selection: Selection,
     icons: IconCache,
+    /// Thumbnails for the icon-grid views (file list only; the tree always uses
+    /// the 16px `icons` cache).
+    thumbs: ThumbCache,
     /// Monotonic token to ignore results from superseded navigations.
     load_token: u64,
     last_click: Option<(usize, Instant)>,
@@ -199,6 +301,37 @@ struct Librarian {
     /// Visible height of the list viewport — refined from real scroll events,
     /// estimated from the window height until the first one arrives.
     viewport_h: f32,
+    /// Current window width, tracked so we can estimate the list pane's width
+    /// (for choosing which grid thumbnails to prefetch). Grid *layout* uses the
+    /// exact measured width via `responsive`; this is only the prefetch heuristic.
+    window_w: f32,
+    /// Current tree/list split ratio, mirrored from `pane_grid` so we can derive
+    /// the list pane's width without querying the widget.
+    tree_ratio: f32,
+    /// Monotonic token stamped on thumbnail jobs, bumped each time a grid session
+    /// starts (navigation / size change). Results from a superseded session are
+    /// ignored for control flow (overlay release, background continuation).
+    thumb_token: u64,
+    /// Whether the modal "Loading…" overlay is up: set when a fresh grid session
+    /// finds the *viewport* thumbnails cold, cleared when their extraction lands.
+    overlay_loading: bool,
+    /// Animation frame for the loading spinner, advanced by a timer while the
+    /// overlay is up.
+    spinner_frame: usize,
+    /// Remaining keys for the background pre-cache that warms *every* thumbnail at
+    /// the current size while the user stays in the folder. Drained in chunks; a
+    /// new session releases and replaces it.
+    bg_queue: Vec<ThumbKey>,
+}
+
+/// Which lane a finished full-extraction belongs to, so its completion is
+/// handled correctly: `Lock` releases the loading overlay, `Background` pumps the
+/// next pre-cache chunk, `Prefetch` (scroll/resize) just populates the cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThumbKind {
+    Lock,
+    Prefetch,
+    Background,
 }
 
 #[derive(Debug, Clone)]
@@ -218,7 +351,7 @@ enum Message {
     CloseMenu,
     CursorMoved(Point),
     ModifiersChanged(keyboard::Modifiers),
-    WindowResized(f32),
+    WindowResized(Size),
     Scrolled(scrollable::Viewport),
     MoveSelection(Nav, bool, bool),
     SelectAll,
@@ -230,6 +363,25 @@ enum Message {
     /// Result of an in-place refresh that preserves selection and scroll.
     Reloaded(u64, Result<Vec<Entry>, String>),
     IconsLoaded(Vec<(IconKey, IconImage)>),
+    /// Switch the file list between Details and the icon-grid sizes.
+    ViewModeChanged(ViewMode),
+    /// The fast cache-only sweep over the viewport finished (`lock` = this is the
+    /// session-opening sweep that may raise the loading overlay).
+    ThumbsCached {
+        sweep: CacheSweep,
+        token: u64,
+        lock: bool,
+    },
+    /// A full thumbnail extraction finished; `kind` says which lane it served.
+    ThumbsLoaded {
+        images: Vec<(ThumbKey, IconImage)>,
+        token: u64,
+        kind: ThumbKind,
+    },
+    /// Advance the loading-spinner animation one frame.
+    SpinnerTick,
+    /// Swallowed event (e.g. a click on the modal loading overlay).
+    Noop,
     // --- navigation tree ---
     /// Expand/collapse the tree node with this id.
     TreeToggle(tree::NodeId),
@@ -264,6 +416,7 @@ impl Librarian {
         });
         let mut app = Self {
             worker: ShellWorker::spawn(),
+            thumb_worker: ShellWorker::spawn(),
             history: History::new(start),
             tree: Tree::new(),
             panes,
@@ -271,11 +424,13 @@ impl Librarian {
             content: Content::ThisPc { drives: Vec::new() },
             rows: Vec::new(),
             sort: settings.sort,
+            view_mode: settings.view_mode,
             show_hidden: settings.show_hidden,
             filter: String::new(),
             address: "This PC".to_string(),
             selection: Selection::default(),
             icons: IconCache::default(),
+            thumbs: ThumbCache::default(),
             load_token: 0,
             last_click: None,
             status: String::new(),
@@ -287,6 +442,12 @@ impl Librarian {
             modifiers: keyboard::Modifiers::default(),
             scroll_y: 0.0,
             viewport_h: 720.0 - CHROME_HEIGHT,
+            window_w: 1100.0,
+            tree_ratio: TREE_RATIO,
+            thumb_token: 0,
+            overlay_loading: false,
+            spinner_frame: 0,
+            bg_queue: Vec::new(),
         };
         // Load the starting location, populate the tree's top level (the user's
         // folders + a "This PC" node), and theme the window — all in parallel.
@@ -300,6 +461,7 @@ impl Librarian {
         config::Settings {
             show_hidden: self.show_hidden,
             sort: self.sort,
+            view_mode: self.view_mode,
         }
     }
 
@@ -326,7 +488,7 @@ impl Librarian {
                 Some(Message::CursorMoved(position))
             }
             iced::Event::Window(iced::window::Event::Resized(size)) => {
-                Some(Message::WindowResized(size.height))
+                Some(Message::WindowResized(size))
             }
             _ => None,
         });
@@ -339,10 +501,26 @@ impl Librarian {
             Location::ThisPc => Subscription::none(),
         };
 
-        Subscription::batch([events, watch])
+        // Animate the loading spinner only while the overlay is up, so an idle
+        // app isn't woken on a timer.
+        let spinner = if self.overlay_loading {
+            iced::time::every(SPINNER_TICK).map(|_| Message::SpinnerTick)
+        } else {
+            Subscription::none()
+        };
+
+        Subscription::batch([events, watch, spinner])
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        // The modal loading overlay is a total lock: pointer input is swallowed by
+        // the window-level overlay, and keyboard-driven actions — shortcuts and
+        // text-field edits alike — are dropped here (focus is also cleared when
+        // the overlay raises). The async results that clear the overlay (loads,
+        // thumbnail extraction, the spinner tick) are neither, so they still flow.
+        if self.overlay_loading && (is_input_shortcut(&message) || is_text_edit(&message)) {
+            return Task::none();
+        }
         match message {
             Message::GoBack => {
                 if self.history.go_back().is_some() {
@@ -367,24 +545,28 @@ impl Librarian {
             Message::FilterChanged(value) => {
                 self.filter = value;
                 self.recompute_rows();
+                return self.prefetch_thumbs(false);
             }
             Message::SetHidden(value) => {
                 self.show_hidden = value;
                 self.recompute_rows();
                 config::save(&self.settings());
-                return self.request_icons();
+                // Revealing/hiding files changes the set — re-warm in the
+                // background (covering newly shown files), without the overlay.
+                return Task::batch([self.request_icons(), self.begin_grid_session(false)]);
             }
             Message::SortBy(key) => {
                 self.apply_sort(key);
                 self.recompute_rows();
                 config::save(&self.settings());
+                return self.prefetch_thumbs(false);
             }
             Message::RowClicked(index) => return self.on_click(index),
             Message::ThisPcLoaded(drives) => {
                 self.content = Content::ThisPc { drives };
                 self.recompute_rows();
                 self.status = format!("{} items", self.rows.len());
-                return self.request_icons();
+                return Task::batch([self.request_icons(), self.begin_grid_session(true)]);
             }
             Message::Loaded(token, result) => {
                 if token != self.load_token {
@@ -399,8 +581,12 @@ impl Librarian {
                         self.recompute_rows();
                         self.status = format!("{} items", self.rows.len());
                         let icons = self.request_icons();
+                        // Fresh navigation: open a locking thumbnail session so a
+                        // cold folder shows the modal overlay until its viewport
+                        // thumbnails are built.
+                        let thumbs = self.begin_grid_session(true);
                         let rename = self.begin_pending_rename();
-                        return Task::batch([icons, rename]);
+                        return Task::batch([icons, thumbs, rename]);
                     }
                     Err(error) => {
                         self.status = error.clone();
@@ -435,8 +621,11 @@ impl Librarian {
                     self.restore_selection(&previously);
                     self.status = format!("{} items", self.rows.len());
                     let icons = self.request_icons();
+                    // A refresh keeps you in place — re-warm thumbnails (covering
+                    // any new files) but don't flash the modal overlay.
+                    let thumbs = self.begin_grid_session(false);
                     let rename = self.begin_pending_rename();
-                    return Task::batch([icons, rename]);
+                    return Task::batch([icons, thumbs, rename]);
                 }
                 // A transient read error during a background refresh leaves the
                 // current view untouched rather than blanking it.
@@ -446,6 +635,82 @@ impl Librarian {
                     self.icons.insert(key, image);
                 }
             }
+            Message::ViewModeChanged(mode) => {
+                if self.view_mode != mode {
+                    self.view_mode = mode;
+                    config::save(&self.settings());
+                    // The grid and list scroll geometries differ; start fresh at
+                    // the top, then open a new (locking) thumbnail session for the
+                    // new size.
+                    self.scroll_y = 0.0;
+                    return Task::batch([self.scroll_to(0.0), self.begin_grid_session(true)]);
+                }
+            }
+            Message::ThumbsCached { sweep, token, lock } => {
+                let CacheSweep { hits, misses } = sweep;
+                // Show everything the OS already had cached, immediately.
+                for (key, image) in hits {
+                    self.thumbs.insert(key, image);
+                }
+                // A superseded session: keep the free hits, but don't drive the
+                // overlay or kick off more work for it.
+                if token != self.thumb_token {
+                    self.thumbs.release(misses);
+                    return Task::none();
+                }
+                // Throttle the slow pass to tiles still on screen: a fast scroll
+                // may have moved past some misses while the sweep ran. Release the
+                // ones no longer visible so they can be re-requested if they
+                // scroll back; fully extract only the rest.
+                let extract = self.retain_visible_misses(misses);
+                if extract.is_empty() {
+                    // Viewport already warm. For a locking session, now is the
+                    // moment to start warming the rest of the folder.
+                    return if lock {
+                        self.seed_background()
+                    } else {
+                        Task::none()
+                    };
+                }
+                // The session-opening sweep raises the modal overlay until these
+                // viewport thumbnails finish; scroll/resize prefetches don't.
+                if lock {
+                    self.overlay_loading = true;
+                    // Clear focus so a focused address/filter box can't keep
+                    // receiving keystrokes behind the now-total lock.
+                    return Task::batch([
+                        clear_focus(),
+                        self.extract_full_task(extract, ThumbKind::Lock),
+                    ]);
+                }
+                return self.extract_full_task(extract, ThumbKind::Prefetch);
+            }
+            Message::ThumbsLoaded {
+                images,
+                token,
+                kind,
+            } => {
+                for (key, image) in images {
+                    self.thumbs.insert(key, image);
+                }
+                if token != self.thumb_token {
+                    return Task::none(); // a newer session superseded this lane
+                }
+                match kind {
+                    // The viewport thumbnails are in: drop the overlay, then warm
+                    // the rest of the folder (deferred until now so the viewport
+                    // extraction didn't queue behind background chunks).
+                    ThumbKind::Lock => {
+                        self.overlay_loading = false;
+                        return self.seed_background();
+                    }
+                    ThumbKind::Prefetch => {}
+                    // Pump the next chunk of the full-folder pre-cache.
+                    ThumbKind::Background => return self.next_background_chunk(),
+                }
+            }
+            Message::SpinnerTick => self.spinner_frame = self.spinner_frame.wrapping_add(1),
+            Message::Noop => {}
 
             // --- navigation tree -------------------------------------------
             Message::TreeToggle(id) => {
@@ -483,18 +748,31 @@ impl Librarian {
                 return Task::batch([icons, expand_pc, reveal]);
             }
             Message::PaneResized(event) => {
+                self.tree_ratio = event.ratio;
                 self.panes.resize(event.split, event.ratio);
+                // The list pane's width changed, so the grid may now fit a
+                // different number of columns — prefetch for the new layout.
+                return self.prefetch_thumbs(false);
             }
 
             // --- selection, cursor & context menu --------------------------
             Message::CursorMoved(position) => self.cursor = position,
             Message::ModifiersChanged(modifiers) => self.modifiers = modifiers,
-            Message::WindowResized(height) => {
-                self.viewport_h = (height - CHROME_HEIGHT).max(ROW_HEIGHT);
+            Message::WindowResized(size) => {
+                self.window_w = size.width;
+                self.viewport_h = (size.height - CHROME_HEIGHT).max(ROW_HEIGHT);
+                // A wider/narrower window changes the grid's column count.
+                return self.prefetch_thumbs(false);
             }
             Message::Scrolled(viewport) => {
                 self.scroll_y = viewport.absolute_offset().y;
                 self.viewport_h = viewport.bounds().height;
+                // While the modal overlay is up the viewport is fixed, so don't
+                // prefetch off it; otherwise scrolling reveals new tiles to fetch.
+                if self.overlay_loading {
+                    return Task::none();
+                }
+                return self.prefetch_thumbs(false);
             }
             Message::MoveSelection(nav, extend, focus_only) => {
                 return self.move_selection(nav, extend, focus_only);
@@ -986,6 +1264,143 @@ impl Librarian {
         )
     }
 
+    /// Open a fresh thumbnail session for the current rows: prefetch the viewport
+    /// (raising the modal overlay when `lock` and the viewport is cold) and warm
+    /// *every* thumbnail at the current size in the background. Bumps the session
+    /// token, superseding any session already in flight. A no-op in Details mode.
+    fn begin_grid_session(&mut self, lock: bool) -> Task<Message> {
+        // Supersede the previous session: new token, drop the overlay, and
+        // release any queued (not-yet-dispatched) background keys so they aren't
+        // left marked in-flight forever.
+        self.thumb_token = self.thumb_token.wrapping_add(1);
+        self.overlay_loading = false;
+        let abandoned = std::mem::take(&mut self.bg_queue);
+        self.thumbs.release(abandoned);
+
+        if self.view_mode.thumb_px().is_none() {
+            return Task::none();
+        }
+        let viewport = self.prefetch_thumbs(lock);
+        if lock {
+            // Defer the background pre-cache until the viewport is ready (see the
+            // `ThumbsCached`/`ThumbsLoaded` lock arms): the single thumbnail
+            // worker is FIFO, so seeding it now would queue the viewport
+            // extraction — which the overlay waits on — behind a background chunk.
+            viewport
+        } else {
+            // No overlay to protect, so warm the whole folder right away.
+            Task::batch([viewport, self.seed_background()])
+        }
+    }
+
+    /// Kick off the fast *cache-only* sweep over the viewport's not-yet-known
+    /// thumbnails. `lock` marks this as a session-opening sweep, which raises the
+    /// loading overlay once it reports cold misses. A no-op in Details mode or
+    /// when nothing new is needed. Runs on the dedicated `thumb_worker`.
+    fn prefetch_thumbs(&mut self, lock: bool) -> Task<Message> {
+        let Some(px) = self.view_mode.thumb_px() else {
+            return Task::none();
+        };
+        let keys = self.visible_thumb_keys(px);
+        let needed = self.thumbs.take_unrequested(keys);
+        if needed.is_empty() {
+            return Task::none();
+        }
+        let token = self.thumb_token;
+        let worker = self.thumb_worker.clone();
+        Task::perform(
+            offload(move || extract_cached(&worker, needed)),
+            move |sweep| Message::ThumbsCached { sweep, token, lock },
+        )
+    }
+
+    /// Of `misses`, keep those still near the viewport (returned, to extract) and
+    /// release the rest so they can be re-requested if they scroll back.
+    fn retain_visible_misses(&mut self, misses: Vec<ThumbKey>) -> Vec<ThumbKey> {
+        let Some(px) = self.view_mode.thumb_px() else {
+            self.thumbs.release(misses);
+            return Vec::new();
+        };
+        let visible: std::collections::HashSet<ThumbKey> =
+            self.visible_thumb_keys(px).into_iter().collect();
+        let (extract, skip): (Vec<ThumbKey>, Vec<ThumbKey>) =
+            misses.into_iter().partition(|key| visible.contains(key));
+        self.thumbs.release(skip);
+        extract
+    }
+
+    /// Dispatch a full extraction of `keys` on the dedicated `thumb_worker`,
+    /// tagging the result with the current session token and the given lane — so
+    /// a slow decode never blocks the interactive worker (file ops, icons, open).
+    fn extract_full_task(&self, keys: Vec<ThumbKey>, kind: ThumbKind) -> Task<Message> {
+        let token = self.thumb_token;
+        let worker = self.thumb_worker.clone();
+        Task::perform(
+            offload(move || extract_full(&worker, keys)),
+            move |images| Message::ThumbsLoaded {
+                images,
+                token,
+                kind,
+            },
+        )
+    }
+
+    /// Seed the background pre-cache: every current-row thumbnail that isn't
+    /// cached or already in flight (capped, so a giant folder can't pin the
+    /// worker indefinitely), then dispatch the first chunk. Non-locking.
+    fn seed_background(&mut self) -> Task<Message> {
+        let Some(px) = self.view_mode.thumb_px() else {
+            return Task::none();
+        };
+        let all: Vec<ThumbKey> = self
+            .rows
+            .iter()
+            .filter_map(|row| thumb_key(row, px))
+            .collect();
+        let mut needed = self.thumbs.take_unrequested(all);
+        if needed.len() > MAX_BACKGROUND_PRECACHE {
+            // Over the cap: leave the tail to load on scroll, and release it so
+            // it isn't stuck marked in-flight.
+            let overflow = needed.split_off(MAX_BACKGROUND_PRECACHE);
+            self.thumbs.release(overflow);
+        }
+        self.bg_queue = needed;
+        self.next_background_chunk()
+    }
+
+    /// Dispatch the next chunk of the background pre-cache, if any remain. Each
+    /// chunk's completion pumps the following one (the `ThumbKind::Background`
+    /// arm), warming the folder progressively without one giant task.
+    fn next_background_chunk(&mut self) -> Task<Message> {
+        if self.bg_queue.is_empty() {
+            return Task::none();
+        }
+        let take = self.bg_queue.len().min(BG_CHUNK);
+        let chunk: Vec<ThumbKey> = self.bg_queue.drain(..take).collect();
+        self.extract_full_task(chunk, ThumbKind::Background)
+    }
+
+    /// Thumbnail keys for the grid rows currently near the viewport. Errs on the
+    /// generous side (an extra column and overscan rows) so prefetch covers the
+    /// rendered grid even though it's computed from the *estimated* pane width,
+    /// not the exact width `responsive` lays the grid out against.
+    fn visible_thumb_keys(&self, px: u16) -> Vec<ThumbKey> {
+        let (tile_w, tile_h) = self.view_mode.tile_size();
+        let list_w = (self.window_w * (1.0 - self.tree_ratio) - GRID_PAD * 2.0).max(tile_w);
+        let cols = (list_w / tile_w).floor().max(1.0) as usize + 1;
+        let rows_visible = (self.viewport_h / tile_h).ceil() as usize + 1;
+        let first_row = (self.scroll_y / tile_h).floor() as usize;
+        let start_row = first_row.saturating_sub(GRID_OVERSCAN_ROWS);
+        let end_row = first_row + rows_visible + GRID_OVERSCAN_ROWS;
+
+        let start = (start_row * cols).min(self.rows.len());
+        let end = (end_row * cols).min(self.rows.len());
+        self.rows[start..end]
+            .iter()
+            .filter_map(|row| thumb_key(row, px))
+            .collect()
+    }
+
     // --- view -----------------------------------------------------------------
 
     fn view(&self) -> Element<'_, Message> {
@@ -998,12 +1413,15 @@ impl Librarian {
             // navigation pane — and it follows the divider when it's dragged.
             let content: Element<'_, Message> = match kind {
                 PaneKind::Tree => self.view_tree(),
-                PaneKind::List => column![
-                    self.view_command_bar(),
-                    view_header(self.sort),
-                    self.view_body(),
-                ]
-                .into(),
+                PaneKind::List => {
+                    // The sortable column header belongs to the details view only;
+                    // the icon grids have no columns.
+                    let mut col = column![self.view_command_bar()];
+                    if matches!(self.view_mode, ViewMode::Details) {
+                        col = col.push(view_header(self.sort));
+                    }
+                    col.push(self.view_body()).into()
+                }
             };
             pane_grid::Content::new(content)
         })
@@ -1011,10 +1429,17 @@ impl Librarian {
         .on_resize(8, Message::PaneResized);
 
         let base = column![self.view_toolbar(), split, self.view_status()];
-        match &self.menu {
+        let mut content: Element<'_, Message> = match &self.menu {
             Some(menu) => stack![base, self.view_context_menu(menu)].into(),
             None => base.into(),
+        };
+        // A cold grid load locks the *whole* window behind the modal overlay:
+        // it sits above everything (toolbar, tree, command bar, list) and
+        // swallows pointer input, while `update` suppresses keyboard shortcuts.
+        if self.overlay_loading {
+            content = stack![content, loading_overlay(self.spinner_frame)].into();
         }
+        content
     }
 
     /// The folder-tree sidebar: a scrollable, lazily-expanding directory tree.
@@ -1093,6 +1518,15 @@ impl Librarian {
                 .on_press_maybe(msg)
                 .padding([3, 8])
         };
+        // The view-mode picker sits at the right end of the bar, pushed there by
+        // a flexible spacer (Explorer keeps its view control on the right too).
+        let picker = pick_list(
+            ViewMode::ALL.to_vec(),
+            Some(self.view_mode),
+            Message::ViewModeChanged,
+        )
+        .text_size(13)
+        .padding([3, 8]);
         row![
             cmd("New folder", in_folder.then_some(Message::NewFolder)),
             cmd("Rename", single.then_some(Message::RenameStart)),
@@ -1101,6 +1535,8 @@ impl Librarian {
             cmd("Cut", has_selection.then_some(Message::Cut)),
             cmd("Paste", can_paste.then_some(Message::Paste)),
         ]
+        .push(Space::new().width(Fill))
+        .push(picker)
         .spacing(6)
         // Keep the button group's left edge locked to the first column.
         .padding(iced::Padding {
@@ -1113,14 +1549,37 @@ impl Librarian {
         .into()
     }
 
-    /// The scrollable file list, with empty-space right-click opening a menu.
+    /// The file view: either the details list or, for the icon modes, a wrapped
+    /// thumbnail grid. Both scroll, and empty-space right-click opens a menu.
     fn view_body(&self) -> Element<'_, Message> {
-        let list = scrollable(self.view_list())
-            .id(LIST_ID)
-            .on_scroll(Message::Scrolled)
-            .height(Fill);
-        mouse_area(list)
-            .on_right_press(Message::BackgroundRightClicked)
+        match self.view_mode.thumb_px() {
+            None => {
+                let list = scrollable(self.view_list())
+                    .id(LIST_ID)
+                    .on_scroll(Message::Scrolled)
+                    .height(Fill);
+                mouse_area(list)
+                    .on_right_press(Message::BackgroundRightClicked)
+                    .into()
+            }
+            // `responsive` hands us the pane's exact width so the grid lays out
+            // its columns precisely (the prefetch path only estimates the width).
+            // The loading overlay is drawn at the window level (see `view`), so
+            // the lock covers the whole picker, not just the grid.
+            Some(px) => responsive(move |size| self.view_grid(size, px)).into(),
+        }
+    }
+
+    /// The placeholder shown in the file area when there are no rows.
+    fn empty_list_message(&self) -> Element<'_, Message> {
+        let msg = match &self.content {
+            Content::Folder { loading: true, .. } => "Loading…",
+            Content::Error(e) => e.as_str(),
+            _ => "Empty",
+        };
+        container(text(msg.to_string()))
+            .padding(16)
+            .width(Fill)
             .into()
     }
 
@@ -1157,15 +1616,7 @@ impl Librarian {
 
     fn view_list(&self) -> Element<'_, Message> {
         if self.rows.is_empty() {
-            let msg = match &self.content {
-                Content::Folder { loading: true, .. } => "Loading…",
-                Content::Error(e) => e.as_str(),
-                _ => "Empty",
-            };
-            return container(text(msg.to_string()))
-                .padding(16)
-                .width(Fill)
-                .into();
+            return self.empty_list_message();
         }
 
         // Virtualize: build Elements only for the rows in (or near) the
@@ -1236,6 +1687,115 @@ impl Librarian {
             .style(move |theme: &Theme| row_style(theme, selected, lead));
 
         mouse_area(inner)
+            .on_press(Message::RowClicked(index))
+            .on_right_press(Message::RowRightClicked(index))
+            .into()
+    }
+
+    /// A virtualized, wrapped grid of thumbnail tiles. `size` is the pane's exact
+    /// inner size (from `responsive`); we fit as many `tile_w`-wide columns as it
+    /// holds and build Elements only for the tile-rows near the viewport, padding
+    /// the rest with spacers so the scrollbar geometry matches the full grid.
+    fn view_grid(&self, size: iced::Size, px: u16) -> Element<'_, Message> {
+        let content: Element<'_, Message> = if self.rows.is_empty() {
+            self.empty_list_message()
+        } else {
+            let (tile_w, tile_h) = self.view_mode.tile_size();
+            let avail = (size.width - GRID_PAD * 2.0 - SCROLLBAR_ALLOWANCE).max(tile_w);
+            let cols = (avail / tile_w).floor().max(1.0) as usize;
+            let total = self.rows.len();
+            let grid_rows = total.div_ceil(cols);
+            let (start_row, end_row) = window_for(
+                self.scroll_y,
+                size.height,
+                grid_rows,
+                tile_h,
+                GRID_OVERSCAN_ROWS,
+            );
+
+            let mut col = column![].width(Fill);
+            let top_pad = start_row as f32 * tile_h;
+            if top_pad > 0.0 {
+                col = col.push(Space::new().height(top_pad));
+            }
+            for r in start_row..end_row {
+                let mut line = row![].width(Fill).height(tile_h);
+                for c in 0..cols {
+                    let i = r * cols + c;
+                    if i >= total {
+                        break;
+                    }
+                    line = line.push(self.view_tile(i, &self.rows[i], px));
+                }
+                col = col.push(line);
+            }
+            let bottom_pad = (grid_rows - end_row) as f32 * tile_h;
+            if bottom_pad > 0.0 {
+                col = col.push(Space::new().height(bottom_pad));
+            }
+            container(col).padding([0.0, GRID_PAD]).into()
+        };
+
+        let scroll = scrollable(content)
+            .id(LIST_ID)
+            .on_scroll(Message::Scrolled)
+            .height(Fill);
+        mouse_area(scroll)
+            .on_right_press(Message::BackgroundRightClicked)
+            .into()
+    }
+
+    /// One grid tile: a centered thumbnail (or a placeholder box while it loads)
+    /// above a single-line, ellipsized label. Mouse behavior mirrors the list
+    /// rows — click selects, double-click activates, right-click opens the menu —
+    /// and the label becomes an inline rename field while this tile is renaming.
+    fn view_tile<'a>(&'a self, index: usize, data: &'a Row, px: u16) -> Element<'a, Message> {
+        let (tile_w, tile_h) = self.view_mode.tile_size();
+        let pxf = px as f32;
+
+        let cached = thumb_key(data, px).and_then(|key| self.thumbs.get(&key).cloned());
+        let thumb: Element<'_, Message> = match cached {
+            Some(handle) => image(handle)
+                .width(pxf)
+                .height(pxf)
+                .content_fit(iced::ContentFit::Contain)
+                .into(),
+            None => container(Space::new())
+                .width(pxf)
+                .height(pxf)
+                .style(thumb_placeholder_style)
+                .into(),
+        };
+        let thumb_box = container(thumb).height(pxf).center_x(Fill);
+
+        let name: Element<'_, Message> = match &self.renaming {
+            Some(rename) if rename.index == index => text_input("", &rename.value)
+                .id(RENAME_ID)
+                .on_input(Message::RenameChanged)
+                .on_submit(Message::RenameCommit)
+                .size(12)
+                .width(Fill)
+                .into(),
+            _ => ellipsized(data.label.clone())
+                .size(12)
+                .width(Fill)
+                .align_x(iced::alignment::Horizontal::Center)
+                .into(),
+        };
+
+        let selected = self.selection.contains(index);
+        let lead = self.selection.lead() == Some(index);
+        let body = column![thumb_box, name]
+            .width(Fill)
+            .spacing(TILE_GAP)
+            .align_x(Center);
+        let tile = container(body)
+            .width(tile_w)
+            .height(tile_h)
+            .padding(TILE_PAD)
+            .style(move |theme: &Theme| tile_style(theme, selected, lead));
+
+        mouse_area(tile)
             .on_press(Message::RowClicked(index))
             .on_right_press(Message::RowRightClicked(index))
             .into()
@@ -1363,6 +1923,75 @@ fn row_style(theme: &Theme, selected: bool, lead: bool) -> container::Style {
         };
     }
     style
+}
+
+/// An icon-grid tile's background: highlighted when selected, with a thin focus
+/// border on the lead tile — the grid counterpart of [`row_style`].
+fn tile_style(theme: &Theme, selected: bool, lead: bool) -> container::Style {
+    let palette = theme.extended_palette();
+    let mut style = container::Style {
+        border: Border {
+            radius: 4.0.into(),
+            ..Border::default()
+        },
+        ..container::Style::default()
+    };
+    if selected {
+        style.background = Some(palette.primary.weak.color.into());
+        style.text_color = Some(palette.primary.weak.text);
+    }
+    if lead {
+        style.border = Border {
+            color: palette.primary.strong.color,
+            width: 1.0,
+            radius: 4.0.into(),
+        };
+    }
+    style
+}
+
+/// A subtle filled box standing in for a thumbnail that hasn't loaded yet, so a
+/// scrolling grid shows tile-shaped placeholders rather than blank gaps.
+fn thumb_placeholder_style(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(palette.background.weak.color.into()),
+        border: Border {
+            radius: 3.0.into(),
+            ..Border::default()
+        },
+        ..container::Style::default()
+    }
+}
+
+/// The modal "Loading…" overlay drawn over the grid while a cold viewport builds:
+/// a spinning circle and label on a semi-transparent scrim that swallows clicks
+/// (via the wrapping `mouse_area`) so the grid underneath is locked.
+fn loading_overlay(frame: usize) -> Element<'static, Message> {
+    let glyph = SPINNER_FRAMES[frame % SPINNER_FRAMES.len()];
+    let panel = column![text(glyph.to_string()).size(40), text("Loading…").size(14)]
+        .spacing(10)
+        .align_x(Center);
+    let scrim = container(panel)
+        .width(Fill)
+        .height(Fill)
+        .center_x(Fill)
+        .center_y(Fill)
+        .style(loading_scrim_style);
+    mouse_area(scrim)
+        .on_press(Message::Noop)
+        .on_right_press(Message::Noop)
+        .into()
+}
+
+/// Semi-transparent dim layer for the loading overlay: the window background at
+/// partial opacity, so the locked grid shows through faintly.
+fn loading_scrim_style(theme: &Theme) -> container::Style {
+    let base = theme.extended_palette().background.base.color;
+    container::Style {
+        background: Some(iced::Color { a: 0.78, ..base }.into()),
+        ..container::Style::default()
+    }
 }
 
 /// Background of the folder-tree pane — a touch darker than the file list to
@@ -1558,6 +2187,48 @@ fn unique_folder_name(dir: &Path) -> String {
         .unwrap_or_else(|| BASE.to_string())
 }
 
+/// Whether a message is a keyboard-driven action — exactly the set
+/// [`key_to_message`] produces. These are dropped while the modal loading overlay
+/// is up so the lock is total (pointer is already blocked by the overlay). Keep
+/// this in sync with `key_to_message`.
+fn is_input_shortcut(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::Copy
+            | Message::Cut
+            | Message::Paste
+            | Message::SelectAll
+            | Message::MoveSelection(..)
+            | Message::Activate
+            | Message::GoUp
+            | Message::DeleteSelected
+            | Message::RenameStart
+            | Message::Refresh
+            | Message::CloseMenu
+    )
+}
+
+/// Whether a message is a text-field edit (address bar, filter, inline rename).
+/// Dropped alongside the shortcuts while the loading overlay is up, so a field
+/// that was focused as the overlay raised can't be edited behind it.
+fn is_text_edit(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::AddressChanged(_)
+            | Message::AddressSubmit
+            | Message::FilterChanged(_)
+            | Message::RenameChanged(_)
+            | Message::RenameCommit
+    )
+}
+
+/// Drop keyboard focus from any text field. iced exposes no "unfocus" task
+/// helper, but `operation::focus` unfocuses every widget whose id *doesn't*
+/// match — so focusing an id no widget uses clears focus everywhere.
+fn clear_focus() -> Task<Message> {
+    iced::widget::operation::focus(BLUR_ID)
+}
+
 /// Translate a global key press into a file-manager command, if it maps to one.
 /// Only called for key events no focused widget consumed.
 fn key_to_message(key: Key, modifiers: keyboard::Modifiers) -> Option<Message> {
@@ -1687,22 +2358,48 @@ fn startup_location() -> Location {
     }
 }
 
-/// The half-open range of row indices to actually render for a list of `total`
-/// rows scrolled to `scroll_y` within a `viewport_h`-tall viewport, padded by
-/// [`OVERSCAN`] on each side and clamped to `0..total`. Pure arithmetic over
-/// uniform [`ROW_HEIGHT`] rows, so it's unit-testable in isolation.
-fn visible_window(scroll_y: f32, viewport_h: f32, total: usize) -> (usize, usize) {
-    if total == 0 {
+/// The half-open range of fixed-height rows to actually render for a list of
+/// `count` rows of height `row_h`, scrolled to `scroll` within a `viewport`-tall
+/// area, padded by `overscan` on each side and clamped to `0..count`. Pure
+/// arithmetic, so it's unit-testable in isolation, and shared by both the
+/// details list (per file row) and the icon grid (per tile row).
+fn window_for(
+    scroll: f32,
+    viewport: f32,
+    count: usize,
+    row_h: f32,
+    overscan: usize,
+) -> (usize, usize) {
+    if count == 0 || row_h <= 0.0 {
         return (0, 0);
     }
-    let first = (scroll_y.max(0.0) / ROW_HEIGHT).floor() as usize;
-    let onscreen = (viewport_h.max(0.0) / ROW_HEIGHT).ceil() as usize + 1;
-    let start = first.saturating_sub(OVERSCAN);
+    let first = (scroll.max(0.0) / row_h).floor() as usize;
+    let onscreen = (viewport.max(0.0) / row_h).ceil() as usize + 1;
+    let start = first.saturating_sub(overscan);
     let end = first
         .saturating_add(onscreen)
-        .saturating_add(OVERSCAN)
-        .min(total);
+        .saturating_add(overscan)
+        .min(count);
     (start, end)
+}
+
+/// The visible window for the details list (uniform [`ROW_HEIGHT`] rows).
+fn visible_window(scroll_y: f32, viewport_h: f32, total: usize) -> (usize, usize) {
+    window_for(scroll_y, viewport_h, total, ROW_HEIGHT, OVERSCAN)
+}
+
+/// The thumbnail key for a grid row at pixel size `px`, or `None` for rows with
+/// no real path (the "This PC" pseudo-root never appears in the list, but drives
+/// and folders all carry a path here).
+fn thumb_key(row: &Row, px: u16) -> Option<ThumbKey> {
+    match &row.target {
+        Location::Path(path) => Some(ThumbKey {
+            path: path.clone(),
+            size: px,
+            mtime: row.modified,
+        }),
+        Location::ThisPc => None,
+    }
 }
 
 /// Extract the requested startup path from CLI arguments. Pure (no filesystem
