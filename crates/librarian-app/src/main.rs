@@ -252,6 +252,11 @@ struct Librarian {
     /// A second, dedicated COM STA worker used *only* for thumbnail extraction,
     /// so a slow `GetImage` decode can't stall the interactive `worker`.
     thumb_worker: ShellWorker,
+    // --- active tab (per-tab state) ------------------------------------------
+    // These fields are the *active* tab's live working state. Inactive tabs keep
+    // their copies in `tabs[i].state`; switching moves state in/out of here (see
+    // `snapshot_flat`/`restore_flat`), so the rest of the app keeps operating on
+    // these flat fields without knowing tabs exist.
     history: History,
     /// The folder navigation tree shown in the left pane.
     tree: Tree,
@@ -322,6 +327,33 @@ struct Librarian {
     /// the current size while the user stays in the folder. Drained in chunks; a
     /// new session releases and replaces it.
     bg_queue: Vec<ThumbKey>,
+    // --- tabs ----------------------------------------------------------------
+    /// All open tabs. The entry at `active` is `None` — that tab's data lives in
+    /// the flat fields above; every other entry parks its state in `Some(..)`.
+    tabs: Vec<Option<TabState>>,
+    /// Index into `tabs` of the active tab.
+    active: usize,
+    /// Globally monotonic source for `load_token`s. Using one counter across all
+    /// tabs makes every in-flight load's token unique, so a load that finishes
+    /// after its tab was left (or closed) is recognized as stale and dropped.
+    next_token: u64,
+}
+
+/// The per-tab state parked while a tab is inactive — a mirror of the flat
+/// per-tab fields on `Librarian`, moved in and out on tab switches.
+struct TabState {
+    history: History,
+    content: Content,
+    rows: Vec<Row>,
+    selection: Selection,
+    filter: String,
+    address: String,
+    status: String,
+    scroll_y: f32,
+    last_click: Option<(usize, Instant)>,
+    renaming: Option<Rename>,
+    pending_rename: Option<(PathBuf, String)>,
+    load_token: u64,
 }
 
 /// Which lane a finished full-extraction belongs to, so its completion is
@@ -382,6 +414,20 @@ enum Message {
     SpinnerTick,
     /// Swallowed event (e.g. a click on the modal loading overlay).
     Noop,
+    // --- tabs ---
+    /// Open a new tab (at the "This PC" root) and switch to it.
+    NewTab,
+    /// Open the lead selection's folder in a new tab.
+    OpenInNewTab,
+    /// Switch to the tab at this index.
+    SelectTab(usize),
+    /// Close the tab at this index.
+    CloseTab(usize),
+    /// Close the active tab (keyboard).
+    CloseActiveTab,
+    /// Cycle to the next / previous tab.
+    NextTab,
+    PrevTab,
     // --- navigation tree ---
     /// Expand/collapse the tree node with this id.
     TreeToggle(tree::NodeId),
@@ -448,6 +494,10 @@ impl Librarian {
             overlay_loading: false,
             spinner_frame: 0,
             bg_queue: Vec::new(),
+            // Start with a single tab that owns the flat state above.
+            tabs: vec![None],
+            active: 0,
+            next_token: 0,
         };
         // Load the starting location, populate the tree's top level (the user's
         // folders + a "This PC" node), and theme the window — all in parallel.
@@ -463,6 +513,151 @@ impl Librarian {
             sort: self.sort,
             view_mode: self.view_mode,
         }
+    }
+
+    // --- tabs -----------------------------------------------------------------
+
+    /// The location shown by tab `i` (the active tab's lives in the flat fields;
+    /// the rest in their parked state).
+    fn tab_location(&self, i: usize) -> &Location {
+        if i == self.active {
+            self.history.current()
+        } else {
+            self.tabs[i]
+                .as_ref()
+                .expect("inactive tab has parked state")
+                .history
+                .current()
+        }
+    }
+
+    /// Move the active tab's live flat state out into a parkable [`TabState`],
+    /// leaving the flat fields as cheap placeholders (about to be overwritten by
+    /// the incoming tab). Moves, never clones, so big row/entry vecs stay cheap.
+    fn snapshot_flat(&mut self) -> TabState {
+        TabState {
+            history: std::mem::replace(&mut self.history, History::new(Location::ThisPc)),
+            content: std::mem::replace(&mut self.content, Content::ThisPc { drives: Vec::new() }),
+            rows: std::mem::take(&mut self.rows),
+            selection: std::mem::take(&mut self.selection),
+            filter: std::mem::take(&mut self.filter),
+            address: std::mem::take(&mut self.address),
+            status: std::mem::take(&mut self.status),
+            scroll_y: self.scroll_y,
+            last_click: self.last_click.take(),
+            renaming: self.renaming.take(),
+            pending_rename: self.pending_rename.take(),
+            load_token: self.load_token,
+        }
+    }
+
+    /// Move a parked [`TabState`] back into the live flat fields.
+    fn restore_flat(&mut self, state: TabState) {
+        self.history = state.history;
+        self.content = state.content;
+        self.rows = state.rows;
+        self.selection = state.selection;
+        self.filter = state.filter;
+        self.address = state.address;
+        self.status = state.status;
+        self.scroll_y = state.scroll_y;
+        self.last_click = state.last_click;
+        self.renaming = state.renaming;
+        self.pending_rename = state.pending_rename;
+        self.load_token = state.load_token;
+    }
+
+    /// Reset the flat fields to a brand-new, empty tab at `location` (its content
+    /// is loaded separately by the caller).
+    fn reset_flat(&mut self, location: Location) {
+        self.address = address_text(&location);
+        self.history = History::new(location);
+        self.content = Content::ThisPc { drives: Vec::new() };
+        self.rows.clear();
+        self.selection = Selection::default();
+        self.filter.clear();
+        self.status.clear();
+        self.scroll_y = 0.0;
+        self.last_click = None;
+        self.renaming = None;
+        self.pending_rename = None;
+        self.load_token = 0;
+        self.menu = None;
+    }
+
+    /// Bring the just-restored active tab on screen: finish a load that was
+    /// abandoned mid-flight, else reveal it in the tree, warm its thumbnails, and
+    /// sync the scrollbar to its saved offset.
+    fn show_active(&mut self) -> Task<Message> {
+        self.menu = None;
+        // A tab left mid-load had its result dropped as stale; load it now.
+        if matches!(self.content, Content::Folder { loading: true, .. }) {
+            return self.load_current();
+        }
+        let reveal = match self.history.current().clone() {
+            Location::Path(path) => {
+                self.pending_reveal = Some(path);
+                self.drive_reveal()
+            }
+            Location::ThisPc => {
+                self.pending_reveal = None;
+                Task::none()
+            }
+        };
+        // The scrollable widget (keyed by LIST_ID) kept the previous tab's
+        // offset; snap it to this tab's saved position.
+        let scroll = self.scroll_to(self.scroll_y);
+        let thumbs = self.begin_grid_session(false);
+        Task::batch([reveal, scroll, thumbs])
+    }
+
+    /// Switch to the tab at `index`, parking the current one.
+    fn switch_tab(&mut self, index: usize) -> Task<Message> {
+        if index == self.active || index >= self.tabs.len() {
+            return Task::none();
+        }
+        let parked = self.snapshot_flat();
+        self.tabs[self.active] = Some(parked);
+        self.active = index;
+        let state = self.tabs[index]
+            .take()
+            .expect("inactive tab has parked state");
+        self.restore_flat(state);
+        self.show_active()
+    }
+
+    /// Open a new tab at `location` and switch to it.
+    fn new_tab(&mut self, location: Location) -> Task<Message> {
+        let parked = self.snapshot_flat();
+        self.tabs[self.active] = Some(parked);
+        self.tabs.push(None);
+        self.active = self.tabs.len() - 1;
+        self.reset_flat(location);
+        self.load_current()
+    }
+
+    /// Close the tab at `index`. The last tab is kept (closing it is a no-op).
+    fn close_tab(&mut self, index: usize) -> Task<Message> {
+        if self.tabs.len() <= 1 || index >= self.tabs.len() {
+            return Task::none();
+        }
+        let was_active = index == self.active;
+        self.tabs.remove(index);
+        if was_active {
+            // The closed tab's live state went with it; adopt a neighbor.
+            self.active = index.min(self.tabs.len() - 1);
+            let state = self.tabs[self.active]
+                .take()
+                .expect("inactive tab has parked state");
+            self.restore_flat(state);
+            return self.show_active();
+        }
+        // Closing a parked tab: just keep the active index pointing at the same
+        // tab it did before the removal.
+        if index < self.active {
+            self.active -= 1;
+        }
+        Task::none()
     }
 
     fn theme(&self) -> Theme {
@@ -599,8 +794,9 @@ impl Librarian {
                 // An external change to the open directory: re-enumerate it in
                 // place, preserving selection and scroll (unlike navigation).
                 if let Location::Path(path) = self.history.current().clone() {
-                    self.load_token += 1;
-                    let token = self.load_token;
+                    self.next_token += 1;
+                    let token = self.next_token;
+                    self.load_token = token;
                     return Task::perform(
                         offload(move || read_dir_all(&path).map_err(|e| e.to_string())),
                         move |result| Message::Reloaded(token, result),
@@ -711,6 +907,37 @@ impl Librarian {
             }
             Message::SpinnerTick => self.spinner_frame = self.spinner_frame.wrapping_add(1),
             Message::Noop => {}
+
+            // --- tabs ------------------------------------------------------
+            Message::NewTab => return self.new_tab(Location::ThisPc),
+            Message::OpenInNewTab => {
+                self.menu = None;
+                // Open the menu's target (or lead selection) folder in a new tab.
+                if let Some(Location::Path(path)) = self
+                    .selection
+                    .lead()
+                    .and_then(|i| self.rows.get(i))
+                    .filter(|row| row.is_container)
+                    .map(|row| row.target.clone())
+                {
+                    return self.new_tab(Location::Path(path));
+                }
+            }
+            Message::SelectTab(index) => return self.switch_tab(index),
+            Message::CloseTab(index) => return self.close_tab(index),
+            Message::CloseActiveTab => return self.close_tab(self.active),
+            Message::NextTab => {
+                if self.tabs.len() > 1 {
+                    let next = (self.active + 1) % self.tabs.len();
+                    return self.switch_tab(next);
+                }
+            }
+            Message::PrevTab => {
+                if self.tabs.len() > 1 {
+                    let prev = (self.active + self.tabs.len() - 1) % self.tabs.len();
+                    return self.switch_tab(prev);
+                }
+            }
 
             // --- navigation tree -------------------------------------------
             Message::TreeToggle(id) => {
@@ -944,8 +1171,9 @@ impl Librarian {
                 Task::perform(offload(list_drives), Message::ThisPcLoaded)
             }
             Location::Path(path) => {
-                self.load_token += 1;
-                let token = self.load_token;
+                self.next_token += 1;
+                let token = self.next_token;
+                self.load_token = token;
                 self.content = Content::Folder {
                     entries: Vec::new(),
                     loading: true,
@@ -1428,7 +1656,12 @@ impl Librarian {
         .spacing(1)
         .on_resize(8, Message::PaneResized);
 
-        let base = column![self.view_toolbar(), split, self.view_status()];
+        let base = column![
+            self.view_tabs(),
+            self.view_toolbar(),
+            split,
+            self.view_status()
+        ];
         let mut content: Element<'_, Message> = match &self.menu {
             Some(menu) => stack![base, self.view_context_menu(menu)].into(),
             None => base.into(),
@@ -1580,6 +1813,49 @@ impl Librarian {
         container(text(msg.to_string()))
             .padding(16)
             .width(Fill)
+            .into()
+    }
+
+    /// The tab strip: one chip per open tab (title + close), plus a "+" button.
+    fn view_tabs(&self) -> Element<'_, Message> {
+        let mut strip = row![].spacing(3).align_y(Center);
+        for i in 0..self.tabs.len() {
+            strip = strip.push(self.view_tab(i));
+        }
+        let add = button(text("+").size(16))
+            .on_press(Message::NewTab)
+            .padding([2, 10])
+            .style(tab_add_button_style);
+        strip = strip.push(add);
+        container(strip)
+            .width(Fill)
+            .padding([4, 6])
+            .style(tab_bar_style)
+            .into()
+    }
+
+    fn view_tab(&self, i: usize) -> Element<'_, Message> {
+        let active = i == self.active;
+        let title = tab_title(self.tab_location(i));
+        let label = button(ellipsized(title).size(13).width(Fill))
+            .on_press(Message::SelectTab(i))
+            .padding([2, 6])
+            .width(Fill)
+            .style(move |theme: &Theme, status| tab_label_button_style(theme, status, active));
+        // The close affordance is hidden when only one tab remains (it can't be
+        // closed), so a lone tab doesn't show a dead button.
+        let close: Element<'_, Message> = if self.tabs.len() > 1 {
+            button(text("×").size(14))
+                .on_press(Message::CloseTab(i))
+                .padding([0, 5])
+                .style(tab_close_button_style)
+                .into()
+        } else {
+            Space::new().width(4.0).into()
+        };
+        container(row![label, close].spacing(0).align_y(Center))
+            .width(180.0)
+            .style(move |theme: &Theme| tab_chip_style(theme, active))
             .into()
     }
 
@@ -1829,12 +2105,20 @@ impl Librarian {
     fn view_context_menu(&self, menu: &Menu) -> Element<'_, Message> {
         let on_item = menu.index.is_some() && self.current_dir().is_some();
         let can_paste = self.current_dir().is_some() && self.clip.is_some();
+        // Whether the targeted row is a folder, so "Open in new tab" applies.
+        let on_folder = menu
+            .index
+            .and_then(|i| self.rows.get(i))
+            .is_some_and(|row| row.is_container);
 
         let mut items = column![].width(200.0);
         let mut any = false;
         if on_item {
+            items = items.push(menu_item("Open", Message::OpenSelected));
+            if on_folder {
+                items = items.push(menu_item("Open in new tab", Message::OpenInNewTab));
+            }
             items = items
-                .push(menu_item("Open", Message::OpenSelected))
                 .push(menu_item("Cut", Message::Cut))
                 .push(menu_item("Copy", Message::Copy))
                 .push(menu_item("Rename", Message::RenameStart))
@@ -2036,6 +2320,95 @@ fn tree_row_button_style(theme: &Theme, status: button::Status, selected: bool) 
     style
 }
 
+/// Background of the tab strip — a touch darker, to set it apart from the
+/// toolbar below it.
+/// Scale a color's RGB toward black by `factor` (0 → black, 1 → unchanged),
+/// preserving alpha. Used to derive the darker tab-strip shades.
+fn darken(color: iced::Color, factor: f32) -> iced::Color {
+    iced::Color {
+        r: color.r * factor,
+        g: color.g * factor,
+        b: color.b * factor,
+        a: color.a,
+    }
+}
+
+fn tab_bar_style(theme: &Theme) -> container::Style {
+    let base = theme.extended_palette().background.base.color;
+    container::Style {
+        background: Some(darken(base, 0.5).into()),
+        ..container::Style::default()
+    }
+}
+
+/// A tab chip: the active tab gets the list background (so it reads as connected
+/// to the content below); inactive tabs sit darker, recessed into the strip.
+fn tab_chip_style(theme: &Theme, active: bool) -> container::Style {
+    let palette = theme.extended_palette();
+    let background = if active {
+        palette.background.base.color
+    } else {
+        darken(palette.background.base.color, 0.72)
+    };
+    container::Style {
+        background: Some(background.into()),
+        border: Border {
+            radius: 4.0.into(),
+            ..Border::default()
+        },
+        ..container::Style::default()
+    }
+}
+
+/// The tab's title button: flat, tinting on hover; the active tab's text is
+/// brighter than the inactive ones.
+fn tab_label_button_style(theme: &Theme, status: button::Status, active: bool) -> button::Style {
+    let palette = theme.extended_palette();
+    let mut style = button::Style {
+        background: None,
+        text_color: if active {
+            palette.background.base.text
+        } else {
+            palette.background.strong.color
+        },
+        ..button::Style::default()
+    };
+    if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+        style.text_color = palette.background.base.text;
+    }
+    style
+}
+
+/// The tab's close "×": flat, reddening on hover.
+fn tab_close_button_style(theme: &Theme, status: button::Status) -> button::Style {
+    let palette = theme.extended_palette();
+    let mut style = button::Style {
+        background: None,
+        text_color: palette.background.strong.color,
+        ..button::Style::default()
+    };
+    if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+        style.text_color = palette.danger.base.color;
+    }
+    style
+}
+
+/// The "+" new-tab button: flat, tinting on hover.
+fn tab_add_button_style(theme: &Theme, status: button::Status) -> button::Style {
+    let palette = theme.extended_palette();
+    // Bright white "+" so it stands out against the dark strip.
+    let mut style = button::Style {
+        background: None,
+        text_color: iced::Color::WHITE,
+        ..button::Style::default()
+    };
+    if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+        style.background = Some(palette.background.strong.color.into());
+        style.text_color = iced::Color::WHITE;
+    }
+    style
+}
+
 /// A thin horizontal divider between the folder tree's sections (the user's
 /// folders above, the "This PC" drives section below). Inset from the pane edges
 /// so it reads as a subtle separator rather than a hard border.
@@ -2098,6 +2471,18 @@ fn address_text(location: &Location) -> String {
     match location {
         Location::ThisPc => "This PC".to_string(),
         Location::Path(path) => path.display().to_string(),
+    }
+}
+
+/// Short title for a tab chip: the folder's own name (or the full path for a
+/// drive root that has no file name, e.g. `C:\`), and "This PC" for the root.
+fn tab_title(location: &Location) -> String {
+    match location {
+        Location::ThisPc => "This PC".to_string(),
+        Location::Path(path) => path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string()),
     }
 }
 
@@ -2205,6 +2590,10 @@ fn is_input_shortcut(message: &Message) -> bool {
             | Message::RenameStart
             | Message::Refresh
             | Message::CloseMenu
+            | Message::NewTab
+            | Message::CloseActiveTab
+            | Message::NextTab
+            | Message::PrevTab
     )
 }
 
@@ -2241,6 +2630,11 @@ fn key_to_message(key: Key, modifiers: keyboard::Modifiers) -> Option<Message> {
             Key::Character("x" | "X") => return Some(Message::Cut),
             Key::Character("v" | "V") => return Some(Message::Paste),
             Key::Character("a" | "A") => return Some(Message::SelectAll),
+            Key::Character("t" | "T") => return Some(Message::NewTab),
+            Key::Character("w" | "W") => return Some(Message::CloseActiveTab),
+            // Ctrl+Tab / Ctrl+Shift+Tab cycle tabs.
+            Key::Named(Named::Tab) if shift => return Some(Message::PrevTab),
+            Key::Named(Named::Tab) => return Some(Message::NextTab),
             _ => {}
         }
     }
@@ -2612,6 +3006,17 @@ mod tests {
 
         // Empty list yields an empty window.
         assert_eq!(visible_window(0.0, viewport, 0), (0, 0));
+    }
+
+    #[test]
+    fn tab_titles_use_the_folder_name() {
+        assert_eq!(tab_title(&Location::ThisPc), "This PC");
+        assert_eq!(
+            tab_title(&Location::Path(PathBuf::from("C:\\Users\\j2\\Documents"))),
+            "Documents"
+        );
+        // A drive root has no file name, so it falls back to the full path.
+        assert_eq!(tab_title(&Location::Path(PathBuf::from("C:\\"))), "C:\\");
     }
 
     #[test]
