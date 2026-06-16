@@ -1,6 +1,7 @@
 //! The display-row model: a uniform view over directory entries, drives, and
 //! known folders, plus human-friendly size/time formatting.
 
+use std::path::Path;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Local, Utc};
@@ -8,6 +9,7 @@ use librarian_core::{Entry, Location};
 use librarian_win::{DriveInfo, DriveKind, KnownFolder};
 
 use crate::icons::IconKey;
+use crate::search::SearchHit;
 
 /// One row in the file list, independent of where it came from.
 #[derive(Debug, Clone)]
@@ -70,6 +72,63 @@ pub fn row_from_known(folder: &KnownFolder) -> Row {
         size: None,
         modified: None,
         type_label: "File folder".to_string(),
+    }
+}
+
+/// A row for one search result. The label is the path *relative to the search
+/// root* (so the result's location is visible at a glance, like an editor's
+/// search panel). A directory hit navigates when activated; a file hit opens.
+/// For contents searches `matches` is the hit count, surfaced in the Type column.
+pub fn row_from_hit(hit: &SearchHit, root: &Path) -> Row {
+    let label = hit
+        .path
+        .strip_prefix(root)
+        .unwrap_or(&hit.path)
+        .to_string_lossy()
+        .into_owned();
+
+    if hit.is_dir {
+        return Row {
+            label,
+            icon: IconKey::Folder,
+            is_container: true,
+            target: Location::Path(hit.path.clone()),
+            size: None,
+            modified: None,
+            type_label: "File folder".to_string(),
+        };
+    }
+
+    let ext = file_extension(&hit.path);
+    let type_label = match hit.matches {
+        Some(n) => format!("{} match{}", n, if n == 1 { "" } else { "es" }),
+        None => ext_type_label(&ext),
+    };
+    Row {
+        label,
+        icon: IconKey::Ext(ext),
+        is_container: false,
+        target: Location::Path(hit.path.clone()),
+        size: None,
+        modified: None,
+        type_label,
+    }
+}
+
+/// Lowercase extension without the dot, or `""` for none.
+fn file_extension(path: &Path) -> String {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+/// Human "type" for a file with the given (lowercase, dotless) extension.
+fn ext_type_label(ext: &str) -> String {
+    if ext.is_empty() {
+        "File".to_string()
+    } else {
+        format!("{} File", ext.to_uppercase())
     }
 }
 

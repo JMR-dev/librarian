@@ -8,10 +8,12 @@
 
 pub mod enumerate;
 pub mod history;
+pub mod matcher;
 pub mod model;
 pub mod sort;
 
 pub use enumerate::{DEFAULT_BATCH, read_dir_all, read_dir_batched, read_subdirs};
 pub use history::History;
+pub use matcher::{NameMatcher, find_matching_dirs};
 pub use model::{Attributes, Entry, EntryKind, Location};
 pub use sort::{Sort, SortKey, SortOrder, is_visible, sort_entries};

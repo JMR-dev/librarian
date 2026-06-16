@@ -5,6 +5,7 @@ mod config;
 mod ellipsis;
 mod icons;
 mod rows;
+mod search;
 mod selection;
 mod thumbs;
 mod tree;
@@ -32,6 +33,7 @@ use librarian_win::{
 use ellipsis::ellipsized;
 use icons::{IconCache, IconKey, extract_icons};
 use rows::{Row, format_time, human_size};
+use search::{SearchEvent, SearchHit, SearchMode, SearchSpec};
 use selection::Selection;
 use thumbs::{CacheSweep, ThumbCache, ThumbKey, extract_cached, extract_full};
 use tree::{Reveal, Tree, TreeChild, TreeRow};
@@ -99,6 +101,9 @@ const MAX_BACKGROUND_PRECACHE: usize = 4000;
 const SPINNER_FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
 /// How often the loading spinner advances a frame.
 const SPINNER_TICK: Duration = Duration::from_millis(120);
+/// Idle time after the last search keystroke before the live search runs, so we
+/// don't spawn a ripgrep process for every intermediate character.
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(200);
 
 fn main() -> iced::Result {
     let start = startup_location();
@@ -243,6 +248,18 @@ enum Content {
         entries: Vec<Entry>,
         loading: bool,
     },
+    /// Recursive search results rooted at `root`, streamed in from ripgrep. The
+    /// browsed folder (in `history`) is unchanged underneath, so leaving the
+    /// search (clearing it, or navigating) restores the normal listing.
+    Search {
+        root: PathBuf,
+        query: String,
+        mode: SearchMode,
+        hits: Vec<SearchHit>,
+        /// True once ripgrep has finished (so an empty `hits` means "no results"
+        /// rather than "still searching").
+        done: bool,
+    },
     Error(String),
 }
 
@@ -272,7 +289,6 @@ struct Librarian {
     /// Details list vs. one of the icon-grid sizes.
     view_mode: ViewMode,
     show_hidden: bool,
-    filter: String,
     address: String,
     selection: Selection,
     icons: IconCache,
@@ -327,6 +343,23 @@ struct Librarian {
     /// the current size while the user stays in the folder. Drained in chunks; a
     /// new session releases and replaces it.
     bg_queue: Vec<ThumbKey>,
+    // --- search --------------------------------------------------------------
+    /// Current text in the search box (per tab).
+    search_query: String,
+    /// Whether the search box matches names or contents (per tab).
+    search_mode: SearchMode,
+    /// The running search, if any. Set as the search subscription's identity, so
+    /// assigning a new spec supersedes the previous one (killing its `rg` child);
+    /// cleared when the search finishes or is dismissed. Not parked across tab
+    /// switches — leaving a tab abandons its in-flight search.
+    search_active: Option<SearchSpec>,
+    /// Monotonic id for searches, stamped onto each spec so streamed results from
+    /// a superseded search are recognized as stale and dropped.
+    search_token: u64,
+    /// Monotonic id for search *input*, bumped on each keystroke (and on submit /
+    /// tab switch). A debounced live-search check only runs if it still matches,
+    /// so intermediate keystrokes don't each launch a search.
+    search_seq: u64,
     // --- tabs ----------------------------------------------------------------
     /// All open tabs. The entry at `active` is `None` — that tab's data lives in
     /// the flat fields above; every other entry parks its state in `Some(..)`.
@@ -346,7 +379,6 @@ struct TabState {
     content: Content,
     rows: Vec<Row>,
     selection: Selection,
-    filter: String,
     address: String,
     status: String,
     scroll_y: f32,
@@ -354,6 +386,8 @@ struct TabState {
     renaming: Option<Rename>,
     pending_rename: Option<(PathBuf, String)>,
     load_token: u64,
+    search_query: String,
+    search_mode: SearchMode,
 }
 
 /// Which lane a finished full-extraction belongs to, so its completion is
@@ -374,9 +408,35 @@ enum Message {
     Refresh,
     AddressChanged(String),
     AddressSubmit,
-    FilterChanged(String),
     SetHidden(bool),
     SortBy(SortKey),
+    // --- search ---
+    /// The search box text changed; schedules a debounced live search.
+    SearchChanged(String),
+    /// A debounced live-search check fired, tagged with the input sequence it was
+    /// scheduled for (so superseded keystrokes are ignored).
+    SearchDebounced(u64),
+    /// Run a recursive search for the current box text in the current folder.
+    SearchSubmit,
+    /// Switch between name and contents matching.
+    SearchModeChanged(SearchMode),
+    /// Dismiss search results and restore the folder listing.
+    SearchClear,
+    /// A streamed batch of results from search `token`.
+    SearchBatch {
+        token: u64,
+        hits: Vec<SearchHit>,
+    },
+    /// Search `token` finished (`capped` if it hit the result cap).
+    SearchFinished {
+        token: u64,
+        capped: bool,
+    },
+    /// Search `token` could not run.
+    SearchFailed {
+        token: u64,
+        error: String,
+    },
     RowClicked(usize),
     RowRightClicked(usize),
     BackgroundRightClicked,
@@ -472,7 +532,6 @@ impl Librarian {
             sort: settings.sort,
             view_mode: settings.view_mode,
             show_hidden: settings.show_hidden,
-            filter: String::new(),
             address: "This PC".to_string(),
             selection: Selection::default(),
             icons: IconCache::default(),
@@ -494,6 +553,11 @@ impl Librarian {
             overlay_loading: false,
             spinner_frame: 0,
             bg_queue: Vec::new(),
+            search_query: String::new(),
+            search_mode: SearchMode::default(),
+            search_active: None,
+            search_token: 0,
+            search_seq: 0,
             // Start with a single tab that owns the flat state above.
             tabs: vec![None],
             active: 0,
@@ -535,12 +599,19 @@ impl Librarian {
     /// leaving the flat fields as cheap placeholders (about to be overwritten by
     /// the incoming tab). Moves, never clones, so big row/entry vecs stay cheap.
     fn snapshot_flat(&mut self) -> TabState {
+        // Abandon any in-flight search: dropping its spec stops the subscription
+        // (and kills rg). Mark the parked results "done" so returning to the tab
+        // shows the partial results statically instead of looking unfinished.
+        if self.search_active.take().is_some()
+            && let Content::Search { done, .. } = &mut self.content
+        {
+            *done = true;
+        }
         TabState {
             history: std::mem::replace(&mut self.history, History::new(Location::ThisPc)),
             content: std::mem::replace(&mut self.content, Content::ThisPc { drives: Vec::new() }),
             rows: std::mem::take(&mut self.rows),
             selection: std::mem::take(&mut self.selection),
-            filter: std::mem::take(&mut self.filter),
             address: std::mem::take(&mut self.address),
             status: std::mem::take(&mut self.status),
             scroll_y: self.scroll_y,
@@ -548,6 +619,8 @@ impl Librarian {
             renaming: self.renaming.take(),
             pending_rename: self.pending_rename.take(),
             load_token: self.load_token,
+            search_query: std::mem::take(&mut self.search_query),
+            search_mode: self.search_mode,
         }
     }
 
@@ -557,7 +630,6 @@ impl Librarian {
         self.content = state.content;
         self.rows = state.rows;
         self.selection = state.selection;
-        self.filter = state.filter;
         self.address = state.address;
         self.status = state.status;
         self.scroll_y = state.scroll_y;
@@ -565,6 +637,13 @@ impl Librarian {
         self.renaming = state.renaming;
         self.pending_rename = state.pending_rename;
         self.load_token = state.load_token;
+        self.search_query = state.search_query;
+        self.search_mode = state.search_mode;
+        // The incoming tab carries no live search (in-flight ones were abandoned
+        // when it was parked); any results it has are already in `content`.
+        self.search_active = None;
+        // Invalidate any debounce scheduled by the tab we just left.
+        self.search_seq = self.search_seq.wrapping_add(1);
     }
 
     /// Reset the flat fields to a brand-new, empty tab at `location` (its content
@@ -575,7 +654,6 @@ impl Librarian {
         self.content = Content::ThisPc { drives: Vec::new() };
         self.rows.clear();
         self.selection = Selection::default();
-        self.filter.clear();
         self.status.clear();
         self.scroll_y = 0.0;
         self.last_click = None;
@@ -583,6 +661,10 @@ impl Librarian {
         self.pending_rename = None;
         self.load_token = 0;
         self.menu = None;
+        self.search_query.clear();
+        self.search_mode = SearchMode::default();
+        self.search_active = None;
+        self.search_seq = self.search_seq.wrapping_add(1);
     }
 
     /// Bring the just-restored active tab on screen: finish a load that was
@@ -704,7 +786,15 @@ impl Librarian {
             Subscription::none()
         };
 
-        Subscription::batch([events, watch, spinner])
+        // The active search, keyed by its full spec: starting/changing a search
+        // (new token) tears down the old stream — killing its rg child — and
+        // starts a fresh one.
+        let search = match &self.search_active {
+            Some(spec) => Subscription::run_with(spec.clone(), search_stream),
+            None => Subscription::none(),
+        };
+
+        Subscription::batch([events, watch, spinner, search])
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -737,11 +827,6 @@ impl Librarian {
             Message::AddressSubmit => {
                 return self.navigate(Location::parse(&self.address));
             }
-            Message::FilterChanged(value) => {
-                self.filter = value;
-                self.recompute_rows();
-                return self.prefetch_thumbs(false);
-            }
             Message::SetHidden(value) => {
                 self.show_hidden = value;
                 self.recompute_rows();
@@ -755,6 +840,88 @@ impl Librarian {
                 self.recompute_rows();
                 config::save(&self.settings());
                 return self.prefetch_thumbs(false);
+            }
+            Message::SearchChanged(value) => {
+                // Search live as the user types or pastes, but debounce: schedule
+                // a check tagged with the latest input sequence, and only the
+                // check that's still current (no newer keystroke) actually runs.
+                self.search_query = value;
+                self.search_seq = self.search_seq.wrapping_add(1);
+                let seq = self.search_seq;
+                return Task::perform(
+                    async { tokio::time::sleep(SEARCH_DEBOUNCE).await },
+                    move |_| Message::SearchDebounced(seq),
+                );
+            }
+            Message::SearchDebounced(seq) => {
+                // Ignore if a newer keystroke (or an Enter/tab switch) arrived.
+                if seq == self.search_seq {
+                    return self.run_search_if_changed();
+                }
+            }
+            Message::SearchModeChanged(mode) => {
+                self.search_mode = mode;
+                // Re-run immediately if results are already showing, so toggling
+                // the mode updates them without a second Enter.
+                if matches!(self.content, Content::Search { .. }) {
+                    return self.run_search_if_changed();
+                }
+            }
+            Message::SearchSubmit => {
+                // Enter is the explicit fallback: cancel any pending debounce and
+                // run now — but `run_search_if_changed` makes it a no-op if the
+                // query+mode already match what's shown.
+                self.search_seq = self.search_seq.wrapping_add(1);
+                return self.run_search_if_changed();
+            }
+            Message::SearchClear => return self.clear_search(),
+            Message::SearchBatch { token, hits } => {
+                if token != self.search_token {
+                    return Task::none(); // a newer search superseded this one
+                }
+                if let Content::Search {
+                    hits: existing,
+                    done,
+                    ..
+                } = &mut self.content
+                {
+                    existing.extend(hits);
+                    let found = existing.len();
+                    *done = false;
+                    self.recompute_rows();
+                    self.status = format!("Searching… {found} found");
+                    return Task::batch([self.request_icons(), self.prefetch_thumbs(false)]);
+                }
+            }
+            Message::SearchFinished { token, capped } => {
+                if token != self.search_token {
+                    return Task::none();
+                }
+                // The search is over: drop the subscription so it doesn't restart.
+                self.search_active = None;
+                if let Content::Search { hits, done, .. } = &mut self.content {
+                    *done = true;
+                    let found = hits.len();
+                    self.status = match (found, capped) {
+                        (0, _) => "No results".to_string(),
+                        (n, true) => {
+                            format!("{n} results (showing the first {n}; refine to narrow)")
+                        }
+                        (n, false) => format!("{n} result{}", plural(n)),
+                    };
+                    // Warm thumbnails for the full result set now that it's settled.
+                    return Task::batch([self.request_icons(), self.seed_background()]);
+                }
+            }
+            Message::SearchFailed { token, error } => {
+                if token != self.search_token {
+                    return Task::none();
+                }
+                self.search_active = None;
+                if let Content::Search { done, .. } = &mut self.content {
+                    *done = true;
+                }
+                self.status = error;
             }
             Message::RowClicked(index) => return self.on_click(index),
             Message::ThisPcLoaded(drives) => {
@@ -1142,11 +1309,91 @@ impl Librarian {
         self.load_current()
     }
 
+    // --- search ---------------------------------------------------------------
+
+    /// Launch a search for the current box text only if it differs from what's
+    /// already shown — the shared entry point for live (debounced), submit, and
+    /// mode-change triggers. An empty box leaves search; an unchanged query+mode
+    /// is a no-op (so an Enter that matches the current results does nothing).
+    fn run_search_if_changed(&mut self) -> Task<Message> {
+        let query = self.search_query.trim().to_string();
+        if query.is_empty() {
+            return if matches!(self.content, Content::Search { .. }) {
+                self.clear_search()
+            } else {
+                Task::none()
+            };
+        }
+        let unchanged = matches!(
+            &self.content,
+            Content::Search { query: shown, mode, .. }
+                if shown == &query && *mode == self.search_mode
+        );
+        if unchanged {
+            return Task::none();
+        }
+        self.begin_search()
+    }
+
+    /// Start a recursive ripgrep search for the current box text, rooted at the
+    /// current folder. Switches `content` to [`Content::Search`] (the browsed
+    /// location underneath is untouched, so leaving search restores it) and arms
+    /// the search subscription. A no-op at the "This PC" root; a blank query just
+    /// clears any active search.
+    fn begin_search(&mut self) -> Task<Message> {
+        let query = self.search_query.trim().to_string();
+        let Some(root) = self.current_dir() else {
+            // Search needs a real folder root, not the "This PC" landing page.
+            return Task::none();
+        };
+        if query.is_empty() {
+            return self.clear_search();
+        }
+        self.menu = None;
+        self.selection.clear();
+        self.last_click = None;
+        self.search_token = self.search_token.wrapping_add(1);
+        self.search_active = Some(SearchSpec {
+            token: self.search_token,
+            root: root.clone(),
+            query: query.clone(),
+            mode: self.search_mode,
+        });
+        self.content = Content::Search {
+            root,
+            query,
+            mode: self.search_mode,
+            hits: Vec::new(),
+            done: false,
+        };
+        self.recompute_rows();
+        self.status = "Searching…".to_string();
+        // Open a fresh (empty) thumbnail session and snap to the top; results
+        // populate it as batches stream in.
+        Task::batch([self.scroll_to(0.0), self.begin_grid_session(false)])
+    }
+
+    /// Dismiss search results and restore the folder listing, stopping any
+    /// running search.
+    fn clear_search(&mut self) -> Task<Message> {
+        self.search_active = None;
+        self.search_query.clear();
+        if matches!(self.content, Content::Search { .. }) {
+            // Reloading the current location rebuilds the normal listing.
+            return self.load_current();
+        }
+        Task::none()
+    }
+
     /// (Re)load whatever the history currently points at.
     fn load_current(&mut self) -> Task<Message> {
         self.selection.clear();
         self.last_click = None;
-        self.filter.clear();
+        // Navigating leaves any search behind (and stops it, if running), and
+        // invalidates any debounce a last-moment keystroke may have scheduled.
+        self.search_active = None;
+        self.search_query.clear();
+        self.search_seq = self.search_seq.wrapping_add(1);
         let location = self.history.current().clone();
         self.address = address_text(&location);
 
@@ -1449,29 +1696,37 @@ impl Librarian {
         }
     }
 
-    /// Rebuild `rows` from `content`, applying the current filter and sort.
+    /// Rebuild `rows` from `content`, applying the current sort.
     fn recompute_rows(&mut self) {
         self.rows = match &self.content {
-            Content::ThisPc { drives } => {
-                let mut rows: Vec<Row> = drives.iter().map(rows::row_from_drive).collect();
-                if !self.filter.is_empty() {
-                    let needle = self.filter.to_lowercase();
-                    rows.retain(|r| r.label.to_lowercase().contains(&needle));
-                }
-                rows
-            }
+            Content::ThisPc { drives } => drives.iter().map(rows::row_from_drive).collect(),
             Content::Folder { entries, .. } => {
                 let mut visible: Vec<Entry> = entries
                     .iter()
-                    .filter(|e| is_visible(e, self.show_hidden, &self.filter))
+                    .filter(|e| is_visible(e, self.show_hidden, ""))
                     .cloned()
                     .collect();
                 sort_entries(&mut visible, &self.sort);
                 visible.iter().map(rows::row_from_entry).collect()
             }
+            Content::Search { root, hits, .. } => {
+                let mut rows: Vec<Row> = hits
+                    .iter()
+                    .map(|hit| rows::row_from_hit(hit, root))
+                    .collect();
+                // Results stream in roughly in walk order; present folders first
+                // (Explorer-style), then by the displayed root-relative path, so
+                // the list stays stable and readable as it grows.
+                rows.sort_by(|a, b| {
+                    b.is_container
+                        .cmp(&a.is_container)
+                        .then_with(|| a.label.to_lowercase().cmp(&b.label.to_lowercase()))
+                });
+                rows
+            }
             Content::Error(_) => Vec::new(),
         };
-        // Drop any selection indices that no longer exist after filtering/sort.
+        // Drop any selection indices that no longer exist after the rebuild.
         self.selection.retain_below(self.rows.len());
     }
 
@@ -1806,14 +2061,23 @@ impl Librarian {
     /// The placeholder shown in the file area when there are no rows.
     fn empty_list_message(&self) -> Element<'_, Message> {
         let msg = match &self.content {
-            Content::Folder { loading: true, .. } => "Loading…",
-            Content::Error(e) => e.as_str(),
-            _ => "Empty",
+            Content::Folder { loading: true, .. } => "Loading…".to_string(),
+            Content::Search {
+                done: false, query, ..
+            } => format!("Searching for “{query}”…"),
+            Content::Search {
+                done: true,
+                query,
+                mode,
+                ..
+            } => match mode {
+                SearchMode::Name => format!("No file names match “{query}”"),
+                SearchMode::Contents => format!("No files contain “{query}”"),
+            },
+            Content::Error(e) => e.clone(),
+            _ => "Empty".to_string(),
         };
-        container(text(msg.to_string()))
-            .padding(16)
-            .width(Fill)
-            .into()
+        container(text(msg)).padding(16).width(Fill).into()
     }
 
     /// The tab strip: one chip per open tab (title + close), plus a "+" button.
@@ -1865,7 +2129,31 @@ impl Librarian {
                 .on_press_maybe(msg)
                 .padding([4, 10])
         };
-        row![
+        // Search needs a real folder to recurse from; disabled at "This PC".
+        let can_search = self.current_dir().is_some();
+        let searching = matches!(self.content, Content::Search { .. });
+        let mut search_box = text_input("Search this folder", &self.search_query)
+            .on_input(Message::SearchChanged)
+            .width(200.0);
+        if can_search {
+            search_box = search_box.on_submit(Message::SearchSubmit);
+        }
+        let mode = pick_list(
+            SearchMode::ALL.to_vec(),
+            Some(self.search_mode),
+            Message::SearchModeChanged,
+        )
+        .text_size(13)
+        .padding([4, 6]);
+        // A clear button appears while results are showing, to drop back to the
+        // folder listing.
+        let clear = searching.then(|| {
+            button(text("✕").size(13))
+                .on_press(Message::SearchClear)
+                .padding([4, 8])
+        });
+
+        let mut bar = row![
             nav("←", self.history.can_go_back().then_some(Message::GoBack)),
             nav(
                 "→",
@@ -1877,13 +2165,17 @@ impl Librarian {
                 .on_input(Message::AddressChanged)
                 .on_submit(Message::AddressSubmit)
                 .width(Fill),
-            text_input("Filter", &self.filter)
-                .on_input(Message::FilterChanged)
-                .width(180.0),
+            search_box,
+            mode,
+        ];
+        if let Some(clear) = clear {
+            bar = bar.push(clear);
+        }
+        bar.push(
             checkbox(self.show_hidden)
                 .label("Hidden")
                 .on_toggle(Message::SetHidden),
-        ]
+        )
         .spacing(6)
         .padding(8)
         .align_y(Center)
@@ -2605,9 +2897,12 @@ fn is_text_edit(message: &Message) -> bool {
         message,
         Message::AddressChanged(_)
             | Message::AddressSubmit
-            | Message::FilterChanged(_)
             | Message::RenameChanged(_)
             | Message::RenameCommit
+            | Message::SearchChanged(_)
+            | Message::SearchSubmit
+            | Message::SearchModeChanged(_)
+            | Message::SearchClear
     )
 }
 
@@ -2660,6 +2955,22 @@ fn key_to_message(key: Key, modifiers: keyboard::Modifiers) -> Option<Message> {
 /// `""` for a count of 1, `"s"` otherwise — for pluralizing status text.
 fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
+}
+
+/// Build the message stream for a running search: drive ripgrep (see
+/// [`search::run`]) and tag every event with the spec's token so the update loop
+/// can drop results from a search that's since been superseded.
+///
+/// `+ use<>` keeps the stream `'static` (it captures no borrow of `spec`), as
+/// [`Subscription::run_with`] requires.
+fn search_stream(spec: &SearchSpec) -> impl iced::futures::Stream<Item = Message> + use<> {
+    use iced::futures::StreamExt;
+    let token = spec.token;
+    search::run(spec.clone()).map(move |event| match event {
+        SearchEvent::Batch(hits) => Message::SearchBatch { token, hits },
+        SearchEvent::Done { capped } => Message::SearchFinished { token, capped },
+        SearchEvent::Failed(error) => Message::SearchFailed { token, error },
+    })
 }
 
 /// A stream that emits [`Message::DirChanged`] whenever `path`'s direct
