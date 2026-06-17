@@ -837,6 +837,14 @@ impl Librarian {
         }
     }
 
+    /// Adopt the current location's saved column layout and drop the cached
+    /// auto-fit measurements (refilled by `recompute_rows`/`remeasure_details`
+    /// once the new rows land). Called wherever a load commits to a location.
+    fn adopt_column_layout(&mut self) {
+        self.col_layout = self.column_layout_for(self.history.current());
+        self.col_measure = ColumnMeasure::default();
+    }
+
     /// Begin dragging `col`'s divider: record the grab point and the column's
     /// current resolved width, so motion maps to `start_width + delta`.
     fn begin_divider_drag(&mut self, col: Column) {
@@ -1172,11 +1180,9 @@ impl Librarian {
                 }
                 self.load_pending = false;
                 // The previous folder was kept on screen (under the loading
-                // overlay) during the read, so its column widths didn't pinch;
-                // now adopt the new folder's saved layout and drop the stale
-                // measurements before `recompute_rows` re-measures.
-                self.col_layout = self.column_layout_for(self.history.current());
-                self.col_measure = ColumnMeasure::default();
+                // overlay) during the read, so its columns didn't pinch; now commit
+                // to the new location's columns before `recompute_rows` re-measures.
+                self.adopt_column_layout();
                 match result {
                     Ok(entries) => {
                         self.content = Content::Folder { entries };
@@ -1224,8 +1230,7 @@ impl Librarian {
                     // doesn't think a load is still owed. An ordinary in-place
                     // refresh (no pending load) keeps the current columns.
                     if std::mem::take(&mut self.load_pending) {
-                        self.col_layout = self.column_layout_for(self.history.current());
-                        self.col_measure = ColumnMeasure::default();
+                        self.adopt_column_layout();
                     }
                     let previously = self.selected_paths();
                     self.content = Content::Folder { entries };
@@ -1701,17 +1706,13 @@ impl Librarian {
 
         let load = match location {
             Location::ThisPc => {
-                // Landing pages carry no persisted per-folder layout; reset to the
-                // default and let their (instant) load re-measure.
-                self.col_layout = ColumnLayout::default();
-                self.col_measure = ColumnMeasure::default();
+                self.adopt_column_layout();
                 self.content = Content::default();
                 self.rows.clear();
                 Task::perform(offload(list_drives), Message::ThisPcLoaded)
             }
             Location::Wsl => {
-                self.col_layout = ColumnLayout::default();
-                self.col_measure = ColumnMeasure::default();
+                self.adopt_column_layout();
                 self.content = Content::Wsl {
                     distros: Vec::new(),
                 };
@@ -3658,11 +3659,17 @@ fn window_for(
     }
     let first = (scroll.max(0.0) / row_h).floor() as usize;
     let onscreen = (viewport.max(0.0) / row_h).ceil() as usize + 1;
-    let start = first.saturating_sub(overscan);
     let end = first
         .saturating_add(onscreen)
         .saturating_add(overscan)
         .min(count);
+    // Clamp `start` to `end`, not just to `count`: if the list shrank under a
+    // stale scroll offset (an external change deleted rows while scrolled down),
+    // `first` can sit past the new end, leaving an un-clamped `start` above
+    // `count`. That violates the `0..count` contract and yields an *inverted*
+    // `start..end` that panics the instant a caller slices `rows[start..end]`
+    // (the grid does exactly that). Keep it a well-formed, possibly-empty range.
+    let start = first.saturating_sub(overscan).min(end);
     (start, end)
 }
 
@@ -3996,6 +4003,107 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Regression guard for the "File Pilot crash class" (see
+    /// `docs/crash_class_review_filepilot.md`): a directory that *churns* — a
+    /// file rapidly created and deleted, exactly as a `.lock` file does — must
+    /// never leave a stale row index that later indexes out of bounds. That C
+    /// crash wrote through a NULL aggregate because an accumulation loop was
+    /// guarded by a cached item count, not by the destination's validity.
+    /// Librarian rebuilds rows from scratch on every change and reconciles
+    /// indices with [`Selection::retain_below`] plus the [`window_for`] clamp;
+    /// this drives a real create/delete burst — through the actual notify
+    /// watcher — and on every re-enumeration runs that reconciliation, carrying
+    /// selection + scroll from a *larger* prior listing into the new one. No
+    /// produced index may fall outside the current rows, however the count moved
+    /// between reads, and nothing may panic.
+    #[test]
+    fn rapid_churn_never_leaves_a_stale_row_index() {
+        use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode};
+
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("librarian-churn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A baseline of stable entries, so there's always a listing to hold a
+        // selection within while the lock file flickers in and out beside them.
+        for i in 0..8 {
+            std::fs::write(dir.join(format!("stable-{i}.txt")), b"x").unwrap();
+        }
+
+        // Arm the real watcher with the same settings `watch_stream` uses, so the
+        // burst runs through the genuine notify/debouncer pipeline. We don't
+        // assert on its timing (that's `notify_detects_directory_changes`) —
+        // `_rx` just keeps the channel alive for the duration.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut debouncer = new_debouncer(Duration::from_millis(50), tx).expect("debouncer");
+        debouncer
+            .watcher()
+            .watch(&dir, RecursiveMode::NonRecursive)
+            .expect("watch");
+
+        // Hammer a lock-style file create/delete from a background thread — the
+        // exact File Pilot trigger (`.claude.json.lock` churn).
+        let churn_dir = dir.clone();
+        let churn = std::thread::spawn(move || {
+            let lock = churn_dir.join(".churn.lock");
+            for _ in 0..400 {
+                let _ = std::fs::write(&lock, b"");
+                let _ = std::fs::remove_file(&lock);
+            }
+        });
+
+        // Mirror `recompute_rows`: take a selection/lead that was valid for a
+        // *previous* (possibly longer) listing, then reconcile it to the freshly
+        // enumerated one. `read_dir_all` itself must also tolerate an entry
+        // vanishing mid-scan (it skips a failed `metadata()` — the librarian-side
+        // analog of the entry "appearing/disappearing as the lock file churned").
+        let mut prev_len = 0usize;
+        for _ in 0..400 {
+            let rows = read_dir_all(&dir).expect("enumerate churning dir");
+            let len = rows.len();
+
+            // A selection established against the previous count, reconciled to
+            // the new one. Every surviving index must be a valid `rows` index.
+            let mut selection = Selection::default();
+            selection.select_all(prev_len);
+            selection.retain_below(len);
+            for i in selection.iter() {
+                assert!(i < len, "retain_below left stale index {i} (len {len})");
+                let _ = &rows[i]; // panics if `retain_below` ever stops clamping
+            }
+            assert!(selection.lead().is_none_or(|l| l < len));
+
+            // The virtualized render window, computed from a scroll offset that
+            // was valid for the *old* length, must clamp to the current rows —
+            // this is the slice `view` indexes directly at `self.rows[start..end]`.
+            let stale_scroll = prev_len as f32 * ROW_HEIGHT;
+            let (start, end) = visible_window(stale_scroll, 600.0, len);
+            assert!(
+                end <= len && start <= end,
+                "window {start}..{end} out of 0..{len}"
+            );
+            let _ = &rows[start..end]; // panics if `window_for` ever stops clamping
+
+            // Hardening: an *extreme* stale offset/selection (as if the prior
+            // listing had been vastly larger) must clamp just the same, so the
+            // guard holds even on a run where the churn timing barely moved `len`.
+            let mut huge = Selection::default();
+            huge.select_all(len + 10_000);
+            huge.retain_below(len);
+            assert!(huge.iter().all(|i| i < len));
+            let (s, e) = visible_window(1_000_000.0, 600.0, len);
+            assert!(e <= len && s <= e);
+            let _ = &rows[s..e];
+
+            prev_len = len;
+        }
+
+        churn.join().unwrap();
+        drop(debouncer);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn visible_window_renders_only_the_viewport_plus_overscan() {
         // A 1000-row list, ~25 rows visible (600px / 24px).
@@ -4022,6 +4130,16 @@ mod tests {
 
         // Empty list yields an empty window.
         assert_eq!(visible_window(0.0, viewport, 0), (0, 0));
+
+        // Stale scroll past the end of a shrunk list: the window must stay a
+        // well-formed, in-bounds range (`start <= end <= count`), never inverted.
+        // This is the `0..count` contract that keeps `rows[start..end]` panic-free
+        // after an external change deletes rows while scrolled down.
+        let (start, end) = visible_window(10_000.0 * ROW_HEIGHT, viewport, 5);
+        assert!(
+            start <= end && end <= 5,
+            "got {start}..{end}, must be within 0..5"
+        );
     }
 
     #[test]
