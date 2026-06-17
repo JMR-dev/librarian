@@ -323,17 +323,37 @@ fn reveal_node(node: &mut TreeNode, target: &Path) -> Reveal {
                 return reveal_node(&mut children[i], target);
             }
             // No path child matched. At the top level the drives live under the
-            // "This PC" node (whose own location is pathless), so fall back to
-            // descending into it — one of its drives will prefix the target.
-            if let Some(i) = children
-                .iter()
-                .position(|c| matches!(c.location, Location::ThisPc))
-            {
+            // pathless "This PC" node and the distros under the pathless "Linux"
+            // (Wsl) node, so fall back into whichever virtual root owns this
+            // target — one of its children will prefix it.
+            let virtual_root = if is_wsl_path(target) {
+                Location::Wsl
+            } else {
+                Location::ThisPc
+            };
+            if let Some(i) = children.iter().position(|c| c.location == virtual_root) {
                 return reveal_node(&mut children[i], target);
             }
             Reveal::Stop // target not under any child (hidden, gone, …)
         }
     }
+}
+
+/// Whether `target` lives under the WSL "Linux" group — a `\\wsl.localhost\`
+/// (or legacy `\\wsl$\`) UNC path — so reveal descends into the `Wsl` node
+/// rather than "This PC". A cheap host-segment check keeps this module
+/// filesystem-free.
+fn is_wsl_path(target: &Path) -> bool {
+    let lossy = target.to_string_lossy();
+    let Some(rest) = lossy
+        .strip_prefix(r"\\")
+        .or_else(|| lossy.strip_prefix("//"))
+    else {
+        return false;
+    };
+    let host_len = rest.find(['\\', '/']).unwrap_or(rest.len());
+    let host = &rest[..host_len];
+    host.eq_ignore_ascii_case("wsl.localhost") || host.eq_ignore_ascii_case("wsl$")
 }
 
 /// Among `children`, the index of the one whose path is the longest prefix of
@@ -365,6 +385,11 @@ mod tests {
     /// A pathless "This PC" child — the drives' container at the top level.
     fn this_pc() -> TreeChild {
         TreeChild::lazy("This PC".to_string(), IconKey::Folder, Location::ThisPc)
+    }
+
+    /// A pathless "Linux" child — the WSL distros' container at the top level.
+    fn wsl_group() -> TreeChild {
+        TreeChild::lazy("Linux".to_string(), IconKey::Wsl, Location::Wsl)
     }
 
     /// Find a visible row by label, for assertions.
@@ -552,6 +577,40 @@ mod tests {
         match tree.reveal(&target) {
             Reveal::Load(_, Location::Path(p)) => assert_eq!(p, PathBuf::from("C:\\")),
             other => panic!("expected to load C:\\, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reveal_descends_through_wsl_to_a_distro_path() {
+        // Distros sit under the pathless "Linux" node, so revealing a
+        // \\wsl.localhost\<distro> path must fall back into the Wsl group
+        // (not This PC, which a non-WSL path would).
+        let mut tree = Tree::new();
+        tree.set_children(
+            ROOT_ID,
+            vec![
+                child("Desktop", "C:\\Users\\me\\Desktop"),
+                this_pc(),
+                wsl_group(),
+            ],
+        );
+        let target = PathBuf::from(r"\\wsl.localhost\Ubuntu\home");
+
+        // No top-level path child prefixes the target and it's a WSL path, so
+        // reveal descends into the "Linux" node and asks to load it.
+        let wsl = row_id(&tree, "Linux");
+        match tree.reveal(&target) {
+            Reveal::Load(id, Location::Wsl) => assert_eq!(id, wsl),
+            other => panic!("expected to load the Wsl node, got {other:?}"),
+        }
+
+        // Its distros arrive; the next step descends into the Ubuntu root.
+        tree.set_children(wsl, vec![child("Ubuntu", r"\\wsl.localhost\Ubuntu")]);
+        match tree.reveal(&target) {
+            Reveal::Load(_, Location::Path(p)) => {
+                assert_eq!(p, PathBuf::from(r"\\wsl.localhost\Ubuntu"))
+            }
+            other => panic!("expected to load the Ubuntu distro root, got {other:?}"),
         }
     }
 

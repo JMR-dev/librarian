@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use iced::widget::image::Handle;
 use librarian_win::{
     IconImage, ShellWorker, computer_icon, folder_icon, icon_for_extension, icon_for_path,
+    wsl_icon,
 };
 
 /// What an icon represents. `Path` is used for things with a per-item icon
@@ -20,6 +21,9 @@ pub enum IconKey {
     Folder,
     /// The shell's "This PC" / Computer icon (the drives container node).
     Computer,
+    /// The shell's "Linux" / WSL icon (the penguin), shared by the WSL group node
+    /// and every distro — one local extraction, cached and reused.
+    Wsl,
     Ext(String),
     Path(PathBuf),
 }
@@ -62,6 +66,7 @@ pub fn extract_icons(worker: &ShellWorker, keys: Vec<IconKey>) -> Vec<(IconKey, 
             let image = match &key {
                 IconKey::Folder => worker.run(|apt| folder_icon(apt, false)),
                 IconKey::Computer => worker.run(|apt| computer_icon(apt, false)),
+                IconKey::Wsl => worker.run(|apt| wsl_icon(apt, false)),
                 IconKey::Ext(ext) => {
                     let ext = ext.clone();
                     worker.run(move |apt| icon_for_extension(apt, &ext, false))

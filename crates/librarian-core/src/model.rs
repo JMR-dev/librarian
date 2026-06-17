@@ -4,7 +4,7 @@
 //! Windows file attributes are read from the standard library's cached
 //! `MetadataExt` so enumeration needs no extra syscalls per entry.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::time::SystemTime;
 
 // Raw Windows file-attribute bits (see `MetadataExt::file_attributes`). Defined
@@ -75,13 +75,17 @@ impl Entry {
     }
 }
 
-/// A browsable location. `ThisPc` is the virtual root (drives + known folders);
-/// everything reachable below a real folder is a plain `Path`. More virtual
-/// roots (Recycle Bin, Network) can be added here later.
+/// A browsable location. `ThisPc` and `Wsl` are the virtual roots — `ThisPc`
+/// holds the drives (and known folders), `Wsl` the installed Linux distros;
+/// everything reachable below a real folder (including inside a distro, via its
+/// `\\wsl.localhost\` UNC path) is a plain `Path`. More virtual roots (Recycle
+/// Bin, Network) can be added here later.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Location {
     Path(PathBuf),
     ThisPc,
+    /// The "Linux" group: the landing list of WSL distributions.
+    Wsl,
 }
 
 impl Location {
@@ -89,6 +93,7 @@ impl Location {
     pub fn label(&self) -> String {
         match self {
             Location::ThisPc => "This PC".to_string(),
+            Location::Wsl => "Linux".to_string(),
             Location::Path(p) => p
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -102,7 +107,7 @@ impl Location {
     pub fn as_path(&self) -> Option<&Path> {
         match self {
             Location::Path(p) => Some(p),
-            Location::ThisPc => None,
+            Location::ThisPc | Location::Wsl => None,
         }
     }
 
@@ -111,16 +116,20 @@ impl Location {
         let trimmed = input.trim();
         if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("This PC") {
             Location::ThisPc
+        } else if trimmed.eq_ignore_ascii_case("Linux") || trimmed.eq_ignore_ascii_case("WSL") {
+            Location::Wsl
         } else {
             Location::Path(PathBuf::from(trimmed))
         }
     }
 
     /// The parent location, used by the "Up" command. The parent of a drive
-    /// root (or any path with no parent) is `ThisPc`.
+    /// root (or any path with no parent) is `ThisPc`; the parent of a distro
+    /// root (`\\wsl.localhost\<name>`) is the `Wsl` group.
     pub fn parent(&self) -> Option<Location> {
         match self {
-            Location::ThisPc => None,
+            Location::ThisPc | Location::Wsl => None,
+            Location::Path(p) if is_wsl_root_path(p) => Some(Location::Wsl),
             Location::Path(p) => match p.parent() {
                 Some(parent) if !parent.as_os_str().is_empty() => {
                     Some(Location::Path(parent.to_path_buf()))
@@ -128,5 +137,74 @@ impl Location {
                 _ => Some(Location::ThisPc),
             },
         }
+    }
+}
+
+/// Whether `p` is the root of a WSL distro — a `\\wsl.localhost\<name>` (or
+/// legacy `\\wsl$\<name>`) UNC path with nothing below the distro share. Such a
+/// path has no filesystem parent, so "Up" routes to the `Wsl` group instead.
+fn is_wsl_root_path(p: &Path) -> bool {
+    let mut comps = p.components();
+    let Some(Component::Prefix(prefix)) = comps.next() else {
+        return false;
+    };
+    let Prefix::UNC(server, _share) = prefix.kind() else {
+        return false;
+    };
+    let server = server.to_string_lossy();
+    if !server.eq_ignore_ascii_case("wsl.localhost") && !server.eq_ignore_ascii_case("wsl$") {
+        return false;
+    }
+    // The UNC prefix already includes the distro (the share); a bare distro root
+    // leaves only the root directory, with no further components below it.
+    matches!(comps.next(), Some(Component::RootDir)) && comps.next().is_none()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_virtual_roots() {
+        assert_eq!(Location::parse(""), Location::ThisPc);
+        assert_eq!(Location::parse("This PC"), Location::ThisPc);
+        assert_eq!(Location::parse("linux"), Location::Wsl);
+        assert_eq!(Location::parse("WSL"), Location::Wsl);
+        assert_eq!(
+            Location::parse(r"\\wsl.localhost\Ubuntu"),
+            Location::Path(PathBuf::from(r"\\wsl.localhost\Ubuntu"))
+        );
+    }
+
+    #[test]
+    fn wsl_group_labels_and_has_no_path_or_parent() {
+        assert_eq!(Location::Wsl.label(), "Linux");
+        assert_eq!(Location::Wsl.as_path(), None);
+        assert_eq!(Location::Wsl.parent(), None);
+    }
+
+    #[test]
+    fn distro_root_parent_is_the_wsl_group() {
+        let root = Location::Path(PathBuf::from(r"\\wsl.localhost\Ubuntu"));
+        assert_eq!(root.parent(), Some(Location::Wsl));
+        // The legacy alias resolves the same way.
+        let legacy = Location::Path(PathBuf::from(r"\\wsl$\Ubuntu"));
+        assert_eq!(legacy.parent(), Some(Location::Wsl));
+    }
+
+    #[test]
+    fn inside_a_distro_walks_up_normally() {
+        let sub = Location::Path(PathBuf::from(r"\\wsl.localhost\Ubuntu\home"));
+        assert_eq!(
+            sub.parent(),
+            Some(Location::Path(PathBuf::from(r"\\wsl.localhost\Ubuntu")))
+        );
+    }
+
+    #[test]
+    fn ordinary_unc_share_is_not_a_distro_root() {
+        // A normal network share must keep its This PC fallback, not become Wsl.
+        let share = Location::Path(PathBuf::from(r"\\server\share"));
+        assert_eq!(share.parent(), Some(Location::ThisPc));
     }
 }

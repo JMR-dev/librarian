@@ -116,6 +116,31 @@ pub fn computer_icon(_apt: &Apartment, large: bool) -> Option<IconImage> {
     }
 }
 
+/// The shell's "Linux" (WSL) icon — the penguin Explorer shows for its Linux
+/// navigation node and for each distro under it. The Linux root is a virtual
+/// shell namespace extension addressed by CLSID (not a file path), so we resolve
+/// it by parsing name. This is purely local: it touches the registered icon
+/// handler, never the `\\wsl.localhost` redirector, so it can't wake a distro.
+/// Returns `None` when the extension isn't registered (i.e. WSL absent). Must run
+/// on the COM STA thread.
+pub fn wsl_icon(_apt: &Apartment, large: bool) -> Option<IconImage> {
+    // CLSID of the "Linux" shell folder registered by WSL.
+    const LINUX_FOLDER: &str = "::{B2B4A4D1-2754-4140-A2EB-9A76D9D7CDC6}";
+    let size = if large { 32 } else { 16 };
+    let wide = to_wide(LINUX_FOLDER);
+    unsafe {
+        let factory: IShellItemImageFactory =
+            SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).ok()?;
+        // No thumbnail for a namespace folder, so the shell returns its icon.
+        let hbm = factory
+            .GetImage(SIZE { cx: size, cy: size }, SIIGBF_RESIZETOFIT)
+            .ok()?;
+        let image = hbitmap_to_rgba(hbm);
+        _ = DeleteObject(HGDIOBJ(hbm.0));
+        image
+    }
+}
+
 /// A thumbnail (or, for items without one, the scaled shell icon) for `path`,
 /// fit within a `size`×`size` box, as straight-alpha RGBA. This is the same data
 /// Explorer's icon views show. `size` should be one of the Windows thumbnail
@@ -438,6 +463,18 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn wsl_icon_is_valid_when_present() {
+        // The Linux shell extension is only registered when WSL is installed, so
+        // this returns `None` on a machine without it — both outcomes are fine.
+        // When present, the decoded icon must be well-formed and visible.
+        if let Some(icon) = worker().run(|apt| wsl_icon(apt, false)) {
+            assert!(icon.width > 0 && icon.height > 0);
+            assert_eq!(icon.rgba.len(), (icon.width * icon.height * 4) as usize);
+            assert!(icon.rgba.chunks_exact(4).any(|px| px[3] != 0));
+        }
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::time::SystemTime;
 
 use chrono::{DateTime, Local, Utc};
 use librarian_core::{Entry, Location};
-use librarian_win::{DriveInfo, DriveKind, KnownFolder};
+use librarian_win::{DriveInfo, DriveKind, KnownFolder, WslDistro, distro_unc_path};
 
 use crate::icons::IconKey;
 use crate::search::SearchHit;
@@ -72,6 +72,21 @@ pub fn row_from_known(folder: &KnownFolder) -> Row {
         size: None,
         modified: None,
         type_label: "File folder".to_string(),
+    }
+}
+
+/// A row for one WSL distribution in the "Linux" landing list. Activating it
+/// navigates into the distro's `\\wsl.localhost\<name>` root; it shares the
+/// Linux/penguin icon with the WSL group node.
+pub fn row_from_distro(distro: &WslDistro) -> Row {
+    Row {
+        label: distro.name.clone(),
+        icon: IconKey::Wsl,
+        is_container: true,
+        target: Location::Path(distro_unc_path(&distro.name)),
+        size: None,
+        modified: None,
+        type_label: "Linux distribution".to_string(),
     }
 }
 

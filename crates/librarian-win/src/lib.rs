@@ -16,13 +16,15 @@ pub mod fileop;
 pub mod icon;
 pub mod known;
 pub mod open;
+pub mod wsl;
 
 pub use chrome::apply_window_chrome;
 pub use com::{Apartment, ShellWorker};
 pub use drives::{DriveInfo, DriveKind, list_drives};
 pub use fileop::{copy_items, create_folder, delete_to_recycle, move_items, rename};
 pub use icon::{
-    IconImage, computer_icon, folder_icon, icon_for_extension, icon_for_path, thumbnail,
+    IconImage, computer_icon, folder_icon, icon_for_extension, icon_for_path, thumbnail, wsl_icon,
 };
 pub use known::{KnownFolder, known_folders, user_home};
 pub use open::open_path;
+pub use wsl::{WslDistro, distro_unc_path, list_wsl_distros};

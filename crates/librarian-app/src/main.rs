@@ -31,8 +31,9 @@ use librarian_core::{
     sort_entries,
 };
 use librarian_win::{
-    Apartment, DriveInfo, IconImage, KnownFolder, ShellWorker, copy_items, create_folder,
-    delete_to_recycle, known_folders, list_drives, move_items, rename, user_home,
+    Apartment, DriveInfo, IconImage, KnownFolder, ShellWorker, WslDistro, copy_items,
+    create_folder, delete_to_recycle, known_folders, list_drives, list_wsl_distros, move_items,
+    rename, user_home,
 };
 
 use columns::{ColRule, Column, ColumnLayout};
@@ -288,6 +289,12 @@ enum Content {
         // remain reachable through the navigation tree, which loads them
         // separately.
         drives: Vec<DriveInfo>,
+    },
+    /// The "Linux" landing list: installed WSL distributions. Like `ThisPc`, a
+    /// pathless virtual root whose rows navigate into real `\\wsl.localhost\`
+    /// (UNC) paths.
+    Wsl {
+        distros: Vec<WslDistro>,
     },
     Folder {
         entries: Vec<Entry>,
@@ -568,6 +575,7 @@ enum Message {
     SelectAll,
     Activate,
     ThisPcLoaded(Vec<DriveInfo>),
+    WslLoaded(Vec<WslDistro>),
     Loaded(u64, Result<Vec<Entry>, String>),
     /// The current directory changed on disk; re-enumerate it in place.
     DirChanged,
@@ -805,7 +813,7 @@ impl Librarian {
     fn column_layout_for(&self, location: &Location) -> ColumnLayout {
         match location {
             Location::Path(path) => self.col_store.get(path).copied().unwrap_or_default(),
-            Location::ThisPc => ColumnLayout::default(),
+            Location::ThisPc | Location::Wsl => ColumnLayout::default(),
         }
     }
 
@@ -878,7 +886,7 @@ impl Librarian {
                 self.pending_reveal = Some(path);
                 self.drive_reveal()
             }
-            Location::ThisPc => {
+            Location::ThisPc | Location::Wsl => {
                 self.pending_reveal = None;
                 Task::none()
             }
@@ -977,7 +985,7 @@ impl Librarian {
         // the old watcher and starts one on the new directory.
         let watch = match self.history.current() {
             Location::Path(path) => Subscription::run_with(path.clone(), watch_stream),
-            Location::ThisPc => Subscription::none(),
+            Location::ThisPc | Location::Wsl => Subscription::none(),
         };
 
         // Animate the loading spinner only while the overlay is up, so an idle
@@ -1128,6 +1136,12 @@ impl Librarian {
             Message::RowClicked(index) => return self.on_click(index),
             Message::ThisPcLoaded(drives) => {
                 self.content = Content::ThisPc { drives };
+                self.recompute_rows();
+                self.status = format!("{} items", self.rows.len());
+                return Task::batch([self.request_icons(), self.begin_grid_session(true)]);
+            }
+            Message::WslLoaded(distros) => {
+                self.content = Content::Wsl { distros };
                 self.recompute_rows();
                 self.status = format!("{} items", self.rows.len());
                 return Task::batch([self.request_icons(), self.begin_grid_session(true)]);
@@ -1644,7 +1658,7 @@ impl Librarian {
                 self.pending_reveal = Some(path.clone());
                 self.drive_reveal()
             }
-            Location::ThisPc => {
+            Location::ThisPc | Location::Wsl => {
                 self.pending_reveal = None;
                 Task::none()
             }
@@ -1655,6 +1669,13 @@ impl Librarian {
                 self.content = Content::ThisPc { drives: Vec::new() };
                 self.rows.clear();
                 Task::perform(offload(list_drives), Message::ThisPcLoaded)
+            }
+            Location::Wsl => {
+                self.content = Content::Wsl {
+                    distros: Vec::new(),
+                };
+                self.rows.clear();
+                Task::perform(offload(list_wsl_distros), Message::WslLoaded)
             }
             Location::Path(path) => {
                 self.next_token += 1;
@@ -1730,7 +1751,7 @@ impl Librarian {
     fn current_dir(&self) -> Option<PathBuf> {
         match self.history.current() {
             Location::Path(path) => Some(path.clone()),
-            Location::ThisPc => None,
+            Location::ThisPc | Location::Wsl => None,
         }
     }
 
@@ -1745,7 +1766,7 @@ impl Librarian {
             .filter_map(|i| self.rows.get(i))
             .filter_map(|row| match &row.target {
                 Location::Path(path) => Some(path.clone()),
-                Location::ThisPc => None,
+                Location::ThisPc | Location::Wsl => None,
             })
             .collect()
     }
@@ -1756,7 +1777,7 @@ impl Librarian {
         self.current_dir()?;
         match &self.rows.get(self.selection.lead()?)?.target {
             Location::Path(path) => Some(path.clone()),
-            Location::ThisPc => None,
+            Location::ThisPc | Location::Wsl => None,
         }
     }
 
@@ -1939,6 +1960,7 @@ impl Librarian {
     fn recompute_rows(&mut self) {
         self.rows = match &self.content {
             Content::ThisPc { drives } => drives.iter().map(rows::row_from_drive).collect(),
+            Content::Wsl { distros } => distros.iter().map(rows::row_from_distro).collect(),
             Content::Folder { entries, .. } => {
                 let mut visible: Vec<Entry> = entries
                     .iter()
@@ -2251,7 +2273,7 @@ impl Librarian {
             // Separate the user's folders (above) from the "This PC" drives
             // section (below) with a divider. Skip it when "This PC" is the very
             // first row, so we never lead with a stray rule.
-            if i > 0 && matches!(row.location, Location::ThisPc) {
+            if i > 0 && matches!(row.location, Location::ThisPc | Location::Wsl) {
                 list = list.push(tree_section_divider());
             }
             list = list.push(self.view_tree_row(row));
@@ -2845,7 +2867,7 @@ fn gap() -> Element<'static, Message> {
 fn full_path_text(row: &Row) -> String {
     match &row.target {
         Location::Path(path) => path.display().to_string(),
-        Location::ThisPc => row.label.clone(),
+        Location::ThisPc | Location::Wsl => row.label.clone(),
     }
 }
 
@@ -3245,6 +3267,7 @@ fn menu_panel_style(theme: &Theme) -> container::Style {
 fn address_text(location: &Location) -> String {
     match location {
         Location::ThisPc => "This PC".to_string(),
+        Location::Wsl => "Linux".to_string(),
         Location::Path(path) => path.display().to_string(),
     }
 }
@@ -3254,6 +3277,7 @@ fn address_text(location: &Location) -> String {
 fn tab_title(location: &Location) -> String {
     match location {
         Location::ThisPc => "This PC".to_string(),
+        Location::Wsl => "Linux".to_string(),
         Location::Path(path) => path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -3277,6 +3301,12 @@ fn fetch_tree_roots(worker: &ShellWorker) -> Vec<TreeChild> {
         None => roots.extend(known),
     }
     roots.push(this_pc_tree_child());
+    // Surface the "Linux" group only when WSL is actually present — i.e. the
+    // Lxss registry key lists at least one distro. This startup check is the
+    // sole gate: when it's empty the node (and its penguin icon) never exist.
+    if !list_wsl_distros().is_empty() {
+        roots.push(wsl_tree_child());
+    }
     roots
 }
 
@@ -3297,14 +3327,18 @@ fn home_tree_child(home: PathBuf, folders: Vec<TreeChild>) -> TreeChild {
 }
 
 /// Load the children for a folder-tree node: the drives under the "This PC"
-/// node, or the (visible) subdirectories of a real folder, sorted by name. Runs
-/// on a worker thread via [`offload`]. (Neither path needs the COM worker — the
-/// top-level known folders that do are loaded by [`fetch_tree_roots`].)
+/// node, the WSL distros under the "Linux" node, or the (visible) subdirectories
+/// of a real folder, sorted by name. Runs on a worker thread via [`offload`].
+/// (None of these need the COM worker — the top-level known folders that do are
+/// loaded by [`fetch_tree_roots`].)
 fn fetch_tree_children(location: &Location, show_hidden: bool) -> Result<Vec<TreeChild>, String> {
     match location {
         // "This PC" now contains only the system drives; the user's folders are
         // their own top-level nodes (see [`fetch_tree_roots`]).
         Location::ThisPc => Ok(list_drives().iter().map(tree_child_from_drive).collect()),
+        // The "Linux" group lists the installed WSL distros (registry-sourced,
+        // so listing them never starts a distro).
+        Location::Wsl => Ok(list_wsl_distros().iter().map(tree_child_from_distro).collect()),
         Location::Path(dir) => {
             let mut dirs = read_subdirs(dir).map_err(|e| e.to_string())?;
             dirs.retain(|e| is_visible(e, show_hidden, ""));
@@ -3323,10 +3357,23 @@ fn this_pc_tree_child() -> TreeChild {
     TreeChild::lazy("This PC".to_string(), IconKey::Computer, Location::ThisPc)
 }
 
+/// The standalone "Linux" tree node — an expandable container for the WSL
+/// distros, mirroring the "This PC" node and carrying the shared penguin icon.
+fn wsl_tree_child() -> TreeChild {
+    TreeChild::lazy("Linux".to_string(), IconKey::Wsl, Location::Wsl)
+}
+
 /// A tree child built from a drive, reusing the file-list row mapping so the
 /// label and icon match what the "This PC" listing shows.
 fn tree_child_from_drive(drive: &DriveInfo) -> TreeChild {
     let row = rows::row_from_drive(drive);
+    TreeChild::lazy(row.label, row.icon, row.target)
+}
+
+/// A tree child built from a WSL distro, reusing the landing-list row mapping so
+/// the label, icon, and target match what the "Linux" listing shows.
+fn tree_child_from_distro(distro: &WslDistro) -> TreeChild {
+    let row = rows::row_from_distro(distro);
     TreeChild::lazy(row.label, row.icon, row.target)
 }
 
@@ -3659,7 +3706,7 @@ fn thumb_key(row: &Row, px: u16) -> Option<ThumbKey> {
             size: px,
             mtime: row.modified,
         }),
-        Location::ThisPc => None,
+        Location::ThisPc | Location::Wsl => None,
     }
 }
 
