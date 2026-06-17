@@ -1,15 +1,20 @@
 // Hide the console window on release builds; keep it on debug for logs.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod columns;
 mod config;
 mod ellipsis;
 mod icons;
+mod metrics;
 mod rows;
 mod search;
 mod selection;
+mod theme;
 mod thumbs;
 mod tree;
 
+use std::cell::Cell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -17,7 +22,7 @@ use iced::keyboard::key::Named;
 use iced::keyboard::{self, Key};
 use iced::widget::{
     Space, button, checkbox, column, container, image, mouse_area, pane_grid, pick_list,
-    responsive, row, scrollable, stack, text, text_input,
+    responsive, row, scrollable, stack, text, text_input, tooltip,
 };
 use iced::{Border, Center, Element, Length::Fill, Point, Size, Subscription, Task, Theme};
 
@@ -30,8 +35,10 @@ use librarian_win::{
     delete_to_recycle, known_folders, list_drives, move_items, rename, user_home,
 };
 
+use columns::{ColRule, Column, ColumnLayout};
 use ellipsis::ellipsized;
 use icons::{IconCache, IconKey, extract_icons};
+use metrics::{LIST_TEXT_SIZE, measure_width};
 use rows::{Row, format_time, human_size};
 use search::{SearchEvent, SearchHit, SearchMode, SearchSpec};
 use selection::Selection;
@@ -50,6 +57,12 @@ const BLUR_ID: &str = "librarian-blur";
 /// Fixed height of each file row. Making rows uniform lets keyboard navigation
 /// compute scroll offsets exactly without measuring the rendered list.
 const ROW_HEIGHT: f32 = 24.0;
+/// Fixed height of the column header. Pinning it (rather than letting it shrink
+/// to its buttons) is essential: the header and the list body are `Fill`-height
+/// siblings, and a header that can grow — its full-height divider rules make it
+/// want to — would split the pane in half with the list. Sized to fit a heading
+/// button (text + its vertical padding) with a little breathing room.
+const HEADER_HEIGHT: f32 = 34.0;
 /// Extra rows rendered above and below the viewport, so fast scrolling doesn't
 /// expose blank edges in the one-frame gap before the window updates.
 const OVERSCAN: usize = 6;
@@ -74,6 +87,38 @@ const LIST_PAD: iced::Padding = iced::Padding {
     bottom: 0.0,
     left: 8.0,
 };
+/// Width of a row's leading file-icon cell.
+const ICON_W: f32 = 16.0;
+/// Horizontal gap between adjacent details columns. It doubles as the width of
+/// the draggable divider that sits in the gap, so the header (with dividers) and
+/// the rows (with plain gaps of this width) stay pixel-aligned.
+const COL_GAP: f32 = 8.0;
+/// Smallest width a Date/Type/Size column can be auto-fit or dragged to.
+const MIN_COL_W: f32 = 40.0;
+/// Largest width any column can be *dragged* to (auto-fit never reaches it). A
+/// ceiling keeps a runaway drag from scrolling the list into oblivion.
+const MAX_COL_W: f32 = 1200.0;
+/// Smallest width the Name column can be (dragged or as its fill floor).
+const MIN_NAME_W: f32 = 80.0;
+/// Cap on the Name column's *auto-fit floor*: a folder with a pathologically
+/// long name doesn't get a giant Name column; the name ellipsizes instead (with
+/// the full path on hover). Dragging past this is still allowed (up to MAX_COL_W).
+const MAX_NAME_AUTOFIT: f32 = 520.0;
+/// Slack added to every measured content width so text isn't flush against the
+/// next column's divider, and a hair of digit-width variance can't clip a date.
+const COL_SLACK: f32 = 6.0;
+/// Horizontal padding of a heading button (`[4, 8]` → 8px each side), reserved in
+/// a column's auto-fit width so its label never clips.
+const HEADER_PAD_W: f32 = 16.0;
+/// Extra width a *sorted* column reserves for its " ▲"/" ▼" arrow. Only the sorted
+/// column shows one, so unsorted columns stay snug to their label.
+const SORT_ARROW_W: f32 = 14.0;
+/// Movement (in px) a divider drag must exceed before it pins the column to a
+/// fixed width — so a plain click or a double-click doesn't accidentally pin it.
+const DRAG_THRESHOLD: f32 = 2.0;
+/// Widget id of the column header's horizontal scroll, slaved to the list body so
+/// the two stay aligned when columns are wider than the pane.
+const HEADER_ID: &str = "librarian-header";
 /// Padding inside each icon-grid tile (around the thumbnail + label block).
 const TILE_PAD: f32 = 8.0;
 /// Vertical gap between a tile's thumbnail and its label.
@@ -263,6 +308,55 @@ enum Content {
     Error(String),
 }
 
+/// Cached content-fit widths (logical px) for the four details columns, including
+/// header-label width and slack. Recomputed only when the row set changes (in
+/// `recompute_rows`), since measuring text is comparatively costly; the cheap
+/// per-frame resolve in `view` reads it.
+#[derive(Debug, Clone, Copy, Default)]
+struct ColumnMeasure {
+    name: f32,
+    modified: f32,
+    type_: f32,
+    size: f32,
+}
+
+/// Resolved, ready-to-render pixel widths for the four columns plus the total
+/// content width (used to size the horizontally-scrollable list body). Derived
+/// each frame from the pane width, the cached [`ColumnMeasure`], and the folder's
+/// [`ColumnLayout`].
+#[derive(Debug, Clone, Copy)]
+struct ColumnPx {
+    name: f32,
+    modified: f32,
+    type_: f32,
+    size: f32,
+    /// Full left-to-right content width (padding + icon + cells + gaps).
+    content: f32,
+}
+
+impl ColumnPx {
+    fn get(&self, col: Column) -> f32 {
+        match col {
+            Column::Name => self.name,
+            Column::Modified => self.modified,
+            Column::Type => self.type_,
+            Column::Size => self.size,
+        }
+    }
+}
+
+/// An in-progress column-divider drag. Tracks the grab point and the column's
+/// width when the drag began, so motion maps to `start_width + delta`.
+#[derive(Debug, Clone, Copy)]
+struct ColumnDrag {
+    col: Column,
+    start_cursor_x: f32,
+    start_width: f32,
+    /// Set once the cursor moves past [`DRAG_THRESHOLD`]; until then the gesture
+    /// is still indistinguishable from a click, so the column isn't pinned.
+    moved: bool,
+}
+
 struct Librarian {
     /// The interactive COM worker: icons, file operations, drive queries, open.
     worker: ShellWorker,
@@ -360,6 +454,22 @@ struct Librarian {
     /// tab switch). A debounced live-search check only runs if it still matches,
     /// so intermediate keystrokes don't each launch a search.
     search_seq: u64,
+    // --- details columns -----------------------------------------------------
+    /// The active folder's column sizing rules (per tab). Resolved from
+    /// `col_store` on navigation; default (Name fills, rest auto-fit) otherwise.
+    col_layout: ColumnLayout,
+    /// Cached content-fit widths for the current rows (per tab). Recomputed in
+    /// `recompute_rows`; the cheap per-frame resolve in `view` reads it.
+    col_measure: ColumnMeasure,
+    /// An in-progress divider drag, if any. Transient; not parked across tabs.
+    col_drag: Option<ColumnDrag>,
+    /// Last list-pane width measured by the `responsive` layout, stashed so
+    /// `update` can resolve a column's current width when a drag begins. Interior
+    /// mutability: `view` borrows `&self` but must record what it laid out.
+    list_pane_w: Cell<f32>,
+    /// Per-folder column layouts, keyed by folder path — the persistence backing
+    /// store. Global (not per-tab); folders left at the default aren't kept.
+    col_store: HashMap<PathBuf, ColumnLayout>,
     // --- tabs ----------------------------------------------------------------
     /// All open tabs. The entry at `active` is `None` — that tab's data lives in
     /// the flat fields above; every other entry parks its state in `Some(..)`.
@@ -388,6 +498,8 @@ struct TabState {
     load_token: u64,
     search_query: String,
     search_mode: SearchMode,
+    col_layout: ColumnLayout,
+    col_measure: ColumnMeasure,
 }
 
 /// Which lane a finished full-extraction belongs to, so its completion is
@@ -442,6 +554,13 @@ enum Message {
     BackgroundRightClicked,
     CloseMenu,
     CursorMoved(Point),
+    /// Left mouse button released anywhere — ends an in-progress divider drag.
+    LeftReleased,
+    /// A column divider was pressed: begin a resize drag of the column to its left.
+    ColDividerPress(Column),
+    /// A column divider was double-clicked: restore that column's default width
+    /// (Name fills; the rest auto-fit their content).
+    ColAutoFit(Column),
     ModifiersChanged(keyboard::Modifiers),
     WindowResized(Size),
     Scrolled(scrollable::Viewport),
@@ -558,6 +677,11 @@ impl Librarian {
             search_active: None,
             search_token: 0,
             search_seq: 0,
+            col_layout: ColumnLayout::default(),
+            col_measure: ColumnMeasure::default(),
+            col_drag: None,
+            list_pane_w: Cell::new(0.0),
+            col_store: config::load_columns(),
             // Start with a single tab that owns the flat state above.
             tabs: vec![None],
             active: 0,
@@ -621,6 +745,8 @@ impl Librarian {
             load_token: self.load_token,
             search_query: std::mem::take(&mut self.search_query),
             search_mode: self.search_mode,
+            col_layout: self.col_layout,
+            col_measure: self.col_measure,
         }
     }
 
@@ -639,6 +765,10 @@ impl Librarian {
         self.load_token = state.load_token;
         self.search_query = state.search_query;
         self.search_mode = state.search_mode;
+        self.col_layout = state.col_layout;
+        self.col_measure = state.col_measure;
+        // A divider drag belongs to the tab being left; never carry it across.
+        self.col_drag = None;
         // The incoming tab carries no live search (in-flight ones were abandoned
         // when it was parked); any results it has are already in `content`.
         self.search_active = None;
@@ -650,6 +780,9 @@ impl Librarian {
     /// is loaded separately by the caller).
     fn reset_flat(&mut self, location: Location) {
         self.address = address_text(&location);
+        self.col_layout = self.column_layout_for(&location);
+        self.col_measure = ColumnMeasure::default();
+        self.col_drag = None;
         self.history = History::new(location);
         self.content = Content::ThisPc { drives: Vec::new() };
         self.rows.clear();
@@ -665,6 +798,70 @@ impl Librarian {
         self.search_mode = SearchMode::default();
         self.search_active = None;
         self.search_seq = self.search_seq.wrapping_add(1);
+    }
+
+    /// The persisted column layout for `location`'s folder, or the default
+    /// (Name fills, the rest auto-fit) for untouched folders and "This PC".
+    fn column_layout_for(&self, location: &Location) -> ColumnLayout {
+        match location {
+            Location::Path(path) => self.col_store.get(path).copied().unwrap_or_default(),
+            Location::ThisPc => ColumnLayout::default(),
+        }
+    }
+
+    /// Begin dragging `col`'s divider: record the grab point and the column's
+    /// current resolved width, so motion maps to `start_width + delta`.
+    fn begin_divider_drag(&mut self, col: Column) {
+        let widths = compute_col_px(self.list_pane_w.get(), self.col_measure, self.col_layout);
+        self.col_drag = Some(ColumnDrag {
+            col,
+            start_cursor_x: self.cursor.x,
+            start_width: widths.get(col),
+            moved: false,
+        });
+    }
+
+    /// Apply divider-drag motion as the cursor reaches `cursor_x`: pin the dragged
+    /// column to `start_width + delta` (clamped). Until the cursor passes
+    /// [`DRAG_THRESHOLD`] the gesture is still a possible click, so nothing is
+    /// pinned — that's what lets a plain click or double-click through untouched.
+    fn drag_divider(&mut self, cursor_x: f32) {
+        let Some(drag) = self.col_drag.as_mut() else {
+            return;
+        };
+        let delta = cursor_x - drag.start_cursor_x;
+        if !drag.moved && delta.abs() < DRAG_THRESHOLD {
+            return;
+        }
+        drag.moved = true;
+        let col = drag.col;
+        let (min, max) = width_bounds(col);
+        let width = (drag.start_width + delta).clamp(min, max);
+        self.col_layout.set(col, ColRule::Fixed(width));
+    }
+
+    /// Restore `col` to its default width (Name fills; the rest auto-fit their
+    /// content) — the double-click-divider action — cancelling any drag and
+    /// persisting the change.
+    fn autofit_column(&mut self, col: Column) -> Task<Message> {
+        self.col_drag = None;
+        self.col_layout.set(col, ColumnLayout::default().rule(col));
+        self.persist_columns();
+        Task::none()
+    }
+
+    /// Save the current folder's column layout to the persistent store — dropping
+    /// the entry when it's back to the all-default layout — then write to disk.
+    fn persist_columns(&mut self) {
+        let Some(dir) = self.current_dir() else {
+            return; // "This PC" isn't a folder; nothing to remember.
+        };
+        if self.col_layout.is_default() {
+            self.col_store.remove(&dir);
+        } else {
+            self.col_store.insert(dir, self.col_layout);
+        }
+        config::save_columns(&self.col_store);
     }
 
     /// Bring the just-restored active tab on screen: finish a load that was
@@ -763,6 +960,11 @@ impl Librarian {
             }
             iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
                 Some(Message::CursorMoved(position))
+            }
+            // A left release anywhere ends a column-divider drag, even if the
+            // cursor has left the divider; harmless otherwise.
+            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => {
+                Some(Message::LeftReleased)
             }
             iced::Event::Window(iced::window::Event::Resized(size)) => {
                 Some(Message::WindowResized(size))
@@ -1002,6 +1204,12 @@ impl Librarian {
                 if self.view_mode != mode {
                     self.view_mode = mode;
                     config::save(&self.settings());
+                    // Switching into details needs fresh auto-fit widths, which are
+                    // only measured while in details (skipped by `recompute_rows`
+                    // for the grid views).
+                    if matches!(mode, ViewMode::Details) {
+                        self.col_measure = self.measure_columns();
+                    }
                     // The grid and list scroll geometries differ; start fresh at
                     // the top, then open a new (locking) thumbnail session for the
                     // new size.
@@ -1150,7 +1358,24 @@ impl Librarian {
             }
 
             // --- selection, cursor & context menu --------------------------
-            Message::CursorMoved(position) => self.cursor = position,
+            Message::CursorMoved(position) => {
+                self.cursor = position;
+                // A live divider drag follows the global cursor (the thin divider
+                // can't keep pointer focus once the cursor races past it).
+                if self.col_drag.is_some() {
+                    self.drag_divider(position.x);
+                }
+            }
+            Message::LeftReleased => {
+                // End a divider drag; persist only if it actually resized.
+                if let Some(drag) = self.col_drag.take()
+                    && drag.moved
+                {
+                    self.persist_columns();
+                }
+            }
+            Message::ColDividerPress(col) => self.begin_divider_drag(col),
+            Message::ColAutoFit(col) => return self.autofit_column(col),
             Message::ModifiersChanged(modifiers) => self.modifiers = modifiers,
             Message::WindowResized(size) => {
                 self.window_w = size.width;
@@ -1161,12 +1386,22 @@ impl Librarian {
             Message::Scrolled(viewport) => {
                 self.scroll_y = viewport.absolute_offset().y;
                 self.viewport_h = viewport.bounds().height;
+                // Slave the column header's horizontal offset to the body's, so
+                // the two stay aligned when columns overflow the pane. A no-op in
+                // grid mode (no header widget) and when not scrolled sideways.
+                let sync = iced::widget::operation::scroll_to(
+                    HEADER_ID,
+                    scrollable::AbsoluteOffset {
+                        x: Some(viewport.absolute_offset().x),
+                        y: None,
+                    },
+                );
                 // While the modal overlay is up the viewport is fixed, so don't
                 // prefetch off it; otherwise scrolling reveals new tiles to fetch.
                 if self.overlay_loading {
-                    return Task::none();
+                    return sync;
                 }
-                return self.prefetch_thumbs(false);
+                return Task::batch([sync, self.prefetch_thumbs(false)]);
             }
             Message::MoveSelection(nav, extend, focus_only) => {
                 return self.move_selection(nav, extend, focus_only);
@@ -1396,6 +1631,10 @@ impl Librarian {
         self.search_seq = self.search_seq.wrapping_add(1);
         let location = self.history.current().clone();
         self.address = address_text(&location);
+        // Adopt this folder's saved column layout (default for untouched folders).
+        // Widths are re-measured once its rows arrive, via `recompute_rows`.
+        self.col_layout = self.column_layout_for(&location);
+        self.col_measure = ColumnMeasure::default();
 
         // Reveal & highlight the destination in the folder tree, expanding
         // ancestors as needed (a no-op target for the "This PC" root, which is
@@ -1728,6 +1967,75 @@ impl Librarian {
         };
         // Drop any selection indices that no longer exist after the rebuild.
         self.selection.retain_below(self.rows.len());
+        // The content changed, so the auto-fit column widths may have too. Only
+        // the details view shows columns, so skip the measuring work otherwise.
+        if matches!(self.view_mode, ViewMode::Details) {
+            self.col_measure = self.measure_columns();
+        }
+    }
+
+    /// Measure the content-fit width of each details column for the current rows:
+    /// the wider of the column's widest cell or its header label (plus slack), so
+    /// an auto-fit column shows everything without truncation.
+    ///
+    /// Measuring every cell of a huge folder would be wasteful, so each column
+    /// measures only what it must: Name/Size sample the longest few cells by
+    /// character count (a reliable proxy for the widest); Type measures its small
+    /// set of distinct labels; Date — every value being the same fixed format —
+    /// measures a single representative.
+    fn measure_columns(&self) -> ColumnMeasure {
+        // A column's header floor: label width + the button's padding, plus the
+        // sort-arrow's width *only* for the currently sorted column (the others
+        // show no arrow, so they stay snug to their label).
+        let header = |label: &str, col: Column| {
+            let arrow = if self.sort.key == sort_key_of(col) {
+                SORT_ARROW_W
+            } else {
+                0.0
+            };
+            measure_width(label, LIST_TEXT_SIZE) + HEADER_PAD_W + arrow
+        };
+
+        let labels: Vec<&str> = self.rows.iter().map(|row| row.label.as_str()).collect();
+        let name_content = sample_widest(labels);
+        let name =
+            (name_content.max(header("Name", Column::Name)) + COL_SLACK).clamp(0.0, MAX_NAME_AUTOFIT);
+
+        // All dates share one fixed format, so one non-empty value stands in.
+        let date_sample = self
+            .rows
+            .iter()
+            .find_map(|row| row.modified.map(format_time))
+            .map(|s| measure_width(&s, LIST_TEXT_SIZE))
+            .unwrap_or(0.0);
+        let modified = date_sample.max(header("Date modified", Column::Modified)) + COL_SLACK;
+
+        // Type labels come from a tiny set ("PNG File", "File folder", …).
+        let mut type_content = 0.0_f32;
+        let mut seen: Vec<&str> = Vec::new();
+        for row in &self.rows {
+            if !seen.contains(&row.type_label.as_str()) {
+                seen.push(row.type_label.as_str());
+                type_content = type_content.max(measure_width(&row.type_label, LIST_TEXT_SIZE));
+            }
+        }
+        let type_ = type_content.max(header("Type", Column::Type)) + COL_SLACK;
+
+        // Size strings are short; format the present ones and sample the widest.
+        let sizes: Vec<String> = self
+            .rows
+            .iter()
+            .filter_map(|r| r.size.map(human_size))
+            .collect();
+        let size_content = sample_widest(sizes.iter().map(String::as_str).collect());
+        let size = size_content.max(header("Size", Column::Size)) + COL_SLACK;
+
+        ColumnMeasure {
+            name,
+            modified,
+            type_,
+            size,
+        }
     }
 
     /// Kick off extraction of any icons the current rows need but don't have.
@@ -1897,13 +2205,18 @@ impl Librarian {
             let content: Element<'_, Message> = match kind {
                 PaneKind::Tree => self.view_tree(),
                 PaneKind::List => {
-                    // The sortable column header belongs to the details view only;
-                    // the icon grids have no columns.
-                    let mut col = column![self.view_command_bar()];
-                    if matches!(self.view_mode, ViewMode::Details) {
-                        col = col.push(view_header(self.sort));
-                    }
-                    col.push(self.view_body()).into()
+                    // The sortable, resizable column header belongs to the details
+                    // view only; the icon grids have no columns. In details mode the
+                    // header and list share exact column widths and a horizontal
+                    // scroll offset, both derived from the pane width `responsive`
+                    // measures — so they're built together inside it.
+                    let body: Element<'_, Message> = if matches!(self.view_mode, ViewMode::Details)
+                    {
+                        responsive(move |size| self.view_details(size)).into()
+                    } else {
+                        self.view_body()
+                    };
+                    column![self.view_command_bar(), body].into()
                 }
             };
             pane_grid::Content::new(content)
@@ -2026,36 +2339,75 @@ impl Librarian {
         .push(Space::new().width(Fill))
         .push(picker)
         .spacing(6)
-        // Keep the button group's left edge locked to the first column.
+        // Top-anchored so the buttons sit at the pane's top edge, level with the
+        // nav pane's top edge across the split. Bottom padding gives the bar its
+        // height (and the gap down to the column header).
         .padding(iced::Padding {
-            top: 2.0,
+            top: 0.0,
             right: 8.0,
-            bottom: 2.0,
+            bottom: 6.0,
             left: LIST_PAD.left,
         })
-        .align_y(Center)
+        .align_y(iced::Top)
         .into()
     }
 
     /// The file view: either the details list or, for the icon modes, a wrapped
     /// thumbnail grid. Both scroll, and empty-space right-click opens a menu.
+    /// The details view: the resizable column header above the virtualized list,
+    /// both sized to the same exact column widths and sharing a horizontal scroll
+    /// offset so they stay aligned when the columns are wider than the pane.
+    /// `size` is the pane's measured inner size (from `responsive`).
+    fn view_details(&self, size: Size) -> Element<'_, Message> {
+        // Stash the pane width so a divider drag in `update` (which has no
+        // renderer) can resolve a column's current width. `view` only has `&self`,
+        // hence the `Cell`.
+        self.list_pane_w.set(size.width);
+        let widths = compute_col_px(size.width, self.col_measure, self.col_layout);
+
+        // The header's own horizontal scrollbar is hidden (width 0): it never
+        // scrolls itself, it's driven to follow the body (see the `Scrolled` arm).
+        let header = scrollable(view_header(self.sort, widths))
+            .id(HEADER_ID)
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::new().width(0.0).scroller_width(0.0),
+            ))
+            .width(Fill)
+            // A fixed height keeps the header from claiming `Fill` (its full-height
+            // dividers would otherwise split the pane with the body below).
+            .height(HEADER_HEIGHT);
+
+        // The body scrolls both ways: vertically through the rows (as before) and
+        // horizontally when the columns overflow the pane. Its vertical scrollbar
+        // sits at the pane's right edge because the scrollable's viewport is the
+        // pane width, even though its content is `widths.content` wide.
+        let list = scrollable(self.view_list(widths))
+            .id(LIST_ID)
+            .direction(scrollable::Direction::Both {
+                vertical: scrollable::Scrollbar::default(),
+                horizontal: scrollable::Scrollbar::default(),
+            })
+            .on_scroll(Message::Scrolled)
+            .width(Fill)
+            .height(Fill);
+        let body = mouse_area(list).on_right_press(Message::BackgroundRightClicked);
+
+        // A full-width rule under the header (it doesn't scroll with the columns)
+        // separates the header from the list.
+        column![header, header_rule(), body]
+            .width(Fill)
+            .height(Fill)
+            .into()
+    }
+
+    /// The icon-grid body (details mode renders via [`view_details`] instead).
+    /// `responsive` hands us the pane's exact width so the grid lays out its
+    /// columns precisely (the prefetch path only estimates the width). The loading
+    /// overlay is drawn at the window level (see `view`), so the lock covers the
+    /// whole picker, not just the grid.
     fn view_body(&self) -> Element<'_, Message> {
-        match self.view_mode.thumb_px() {
-            None => {
-                let list = scrollable(self.view_list())
-                    .id(LIST_ID)
-                    .on_scroll(Message::Scrolled)
-                    .height(Fill);
-                mouse_area(list)
-                    .on_right_press(Message::BackgroundRightClicked)
-                    .into()
-            }
-            // `responsive` hands us the pane's exact width so the grid lays out
-            // its columns precisely (the prefetch path only estimates the width).
-            // The loading overlay is drawn at the window level (see `view`), so
-            // the lock covers the whole picker, not just the grid.
-            Some(px) => responsive(move |size| self.view_grid(size, px)).into(),
-        }
+        let px = self.view_mode.thumb_px().unwrap_or_default();
+        responsive(move |size| self.view_grid(size, px)).into()
     }
 
     /// The placeholder shown in the file area when there are no rows.
@@ -2182,7 +2534,7 @@ impl Librarian {
         .into()
     }
 
-    fn view_list(&self) -> Element<'_, Message> {
+    fn view_list(&self, widths: ColumnPx) -> Element<'_, Message> {
         if self.rows.is_empty() {
             return self.empty_list_message();
         }
@@ -2198,12 +2550,14 @@ impl Librarian {
         let top_pad = start as f32 * ROW_HEIGHT;
         let bottom_pad = (total - end) as f32 * ROW_HEIGHT;
 
-        let mut list = column![].width(Fill);
+        // The whole list is exactly `widths.content` wide so it scrolls
+        // horizontally as one piece and row highlights span every column.
+        let mut list = column![].width(widths.content);
         if top_pad > 0.0 {
             list = list.push(Space::new().width(Fill).height(top_pad));
         }
         for index in start..end {
-            list = list.push(self.view_row(index, &self.rows[index]));
+            list = list.push(self.view_row(index, &self.rows[index], widths));
         }
         if bottom_pad > 0.0 {
             list = list.push(Space::new().width(Fill).height(bottom_pad));
@@ -2211,38 +2565,76 @@ impl Librarian {
         list.into()
     }
 
-    fn view_row<'a>(&'a self, index: usize, data: &'a Row) -> Element<'a, Message> {
+    fn view_row<'a>(
+        &'a self,
+        index: usize,
+        data: &'a Row,
+        widths: ColumnPx,
+    ) -> Element<'a, Message> {
         let icon: Element<'_, Message> = match self.icons.get(&data.icon) {
-            Some(handle) => image(handle.clone()).width(16.0).height(16.0).into(),
-            None => Space::new().width(16.0).height(16.0).into(),
+            Some(handle) => image(handle.clone()).width(ICON_W).height(ICON_W).into(),
+            None => Space::new().width(ICON_W).height(ICON_W).into(),
         };
         let size = data.size.map(human_size).unwrap_or_default();
         let modified = data.modified.map(format_time).unwrap_or_default();
 
+        let renaming_this = self.renaming.as_ref().is_some_and(|r| r.index == index);
         // The name cell becomes an editable field while this row is renaming.
-        let name: Element<'_, Message> = match &self.renaming {
-            Some(rename) if rename.index == index => text_input("", &rename.value)
+        let name_cell: Element<'_, Message> = if renaming_this {
+            let value = self
+                .renaming
+                .as_ref()
+                .map(|r| r.value.as_str())
+                .unwrap_or("");
+            text_input("", value)
                 .id(RENAME_ID)
                 .on_input(Message::RenameChanged)
                 .on_submit(Message::RenameCommit)
                 .padding([0, 2])
-                .width(Fill)
-                .into(),
-            // Truncate over-long cells with an ellipsis rather than wrapping.
-            _ => ellipsized(data.label.clone()).width(Fill).into(),
+                .size(LIST_TEXT_SIZE)
+                .width(widths.name)
+                .into()
+        } else {
+            // Truncate over-long names with an ellipsis rather than wrapping.
+            ellipsized(data.label.clone())
+                .size(LIST_TEXT_SIZE)
+                .width(widths.name)
+                .into()
         };
+        // When the name doesn't fit its column (so the ellipsis cropped it),
+        // reveal the full path in a hover tooltip — but never while editing.
+        let name: Element<'_, Message> =
+            if !renaming_this && measure_width(&data.label, LIST_TEXT_SIZE) > widths.name {
+                tooltip(
+                    name_cell,
+                    path_tooltip(full_path_text(data)),
+                    iced::widget::tooltip::Position::FollowCursor,
+                )
+                .into()
+            } else {
+                name_cell
+            };
 
         let line = row![
             icon,
+            gap(),
             name,
-            ellipsized(modified).width(150.0),
-            ellipsized(data.type_label.clone()).width(120.0),
-            // Size is numeric, so right-align it (Explorer does the same).
+            gap(),
+            ellipsized(modified)
+                .size(LIST_TEXT_SIZE)
+                .width(widths.modified),
+            gap(),
+            ellipsized(data.type_label.clone())
+                .size(LIST_TEXT_SIZE)
+                .width(widths.type_),
+            gap(),
+            // Size is numeric, so right-align it (Explorer does the same). It's
+            // the last column, so no trailing gap — it hugs the right edge.
             ellipsized(size)
-                .width(90.0)
+                .size(LIST_TEXT_SIZE)
+                .width(widths.size)
                 .align_x(iced::alignment::Horizontal::Right),
         ]
-        .spacing(8)
         .align_y(Center);
 
         let selected = self.selection.contains(index);
@@ -2250,7 +2642,7 @@ impl Librarian {
         let inner = container(line)
             .padding(LIST_PAD)
             .height(ROW_HEIGHT)
-            .width(Fill)
+            .width(widths.content)
             .align_y(Center)
             .style(move |theme: &Theme| row_style(theme, selected, lead));
 
@@ -2443,9 +2835,51 @@ impl Librarian {
     }
 }
 
-fn view_header(sort: Sort) -> Element<'static, Message> {
+/// A fixed-width spacer matching the inter-column gap; rows use it where the
+/// header uses a draggable divider, so the two stay column-aligned.
+fn gap() -> Element<'static, Message> {
+    Space::new().width(COL_GAP).into()
+}
+
+/// The absolute path shown in a long name's hover tooltip.
+fn full_path_text(row: &Row) -> String {
+    match &row.target {
+        Location::Path(path) => path.display().to_string(),
+        Location::ThisPc => row.label.clone(),
+    }
+}
+
+/// A small floating panel for the full-path tooltip.
+fn path_tooltip(content: String) -> Element<'static, Message> {
+    container(text(content).size(13))
+        .padding([4, 8])
+        .style(tooltip_panel_style)
+        .into()
+}
+
+/// One draggable column divider, occupying the inter-column gap. The whole gap is
+/// the grab target (with a resize cursor); a thin rule marks it. Dragging pins
+/// the column to its left to a fixed width; double-clicking restores its default.
+fn column_divider(col: Column) -> Element<'static, Message> {
+    let rule = container(Space::new().width(1.0).height(Fill)).style(divider_line_style);
+    let handle = container(rule).center_x(COL_GAP).height(Fill);
+    mouse_area(handle)
+        .interaction(iced::mouse::Interaction::ResizingHorizontally)
+        .on_press(Message::ColDividerPress(col))
+        .on_double_click(Message::ColAutoFit(col))
+        .into()
+}
+
+/// The full-width 1px rule beneath the column header, separating it from the list.
+fn header_rule() -> Element<'static, Message> {
+    container(Space::new().width(Fill).height(1.0))
+        .style(divider_line_style)
+        .into()
+}
+
+fn view_header(sort: Sort, widths: ColumnPx) -> Element<'static, Message> {
     use iced::alignment::Horizontal;
-    let heading = |label: &str, key: SortKey, width: iced::Length, align: Horizontal| {
+    let heading = |label: &str, key: SortKey, width: f32, align: Horizontal| {
         let arrow = if sort.key == key {
             match sort.order {
                 SortOrder::Ascending => " ▲",
@@ -2454,30 +2888,41 @@ fn view_header(sort: Sort) -> Element<'static, Message> {
         } else {
             ""
         };
-        button(text(format!("{label}{arrow}")).width(Fill).align_x(align))
-            .on_press(Message::SortBy(key))
-            .width(width)
-            .padding([4, 8])
+        button(
+            text(format!("{label}{arrow}"))
+                .size(LIST_TEXT_SIZE)
+                .width(Fill)
+                .align_x(align),
+        )
+        .on_press(Message::SortBy(key))
+        .width(width)
+        .padding([4, 8])
+        // Flat heading: no filled background — the column dividers and the rule
+        // beneath the header carry the visual structure instead.
+        .style(header_button_style)
     };
 
-    // No leading icon-gutter space here (unlike the rows): the Name heading
-    // spans the icon column so "Name" sits at the column's true left edge —
-    // over the file icons — instead of leaving a blank strip beside the nav
-    // pane. The Fill Name column absorbs the freed width, so Date/Type/Size
-    // still line up with the rows below.
+    // The Name heading spans the icon gutter (icon width + the gap that follows
+    // it) so "Name" sits at the column's true left edge — over the file icons —
+    // matching the rows below, where the name cell starts after that gutter.
+    let name_w = ICON_W + COL_GAP + widths.name;
     row![
-        heading("Name", SortKey::Name, Fill, Horizontal::Left),
+        heading("Name", SortKey::Name, name_w, Horizontal::Left),
+        column_divider(Column::Name),
         heading(
             "Date modified",
             SortKey::Modified,
-            150.0.into(),
+            widths.modified,
             Horizontal::Left
         ),
-        heading("Type", SortKey::Type, 120.0.into(), Horizontal::Left),
-        // Right-aligned to sit over the right-aligned numeric size values.
-        heading("Size", SortKey::Size, 90.0.into(), Horizontal::Right),
+        column_divider(Column::Modified),
+        heading("Type", SortKey::Type, widths.type_, Horizontal::Left),
+        column_divider(Column::Type),
+        // Right-aligned to sit over the right-aligned numeric size values. No
+        // divider after it: it's the last column and hugs the right edge.
+        heading("Size", SortKey::Size, widths.size, Horizontal::Right),
     ]
-    .spacing(8)
+    .height(HEADER_HEIGHT)
     .padding(LIST_PAD)
     .align_y(Center)
     .into()
@@ -2499,6 +2944,29 @@ fn row_style(theme: &Theme, selected: bool, lead: bool) -> container::Style {
         };
     }
     style
+}
+
+/// The thin rule drawn inside a column divider's gap.
+fn divider_line_style(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(crate::theme::divider(theme).into()),
+        ..container::Style::default()
+    }
+}
+
+/// The floating full-path tooltip panel: a contrasting rounded box with a border.
+fn tooltip_panel_style(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(palette.background.weak.color.into()),
+        text_color: Some(palette.background.weak.text),
+        border: Border {
+            color: palette.background.strong.color,
+            width: 1.0,
+            radius: 4.0.into(),
+        },
+        ..container::Style::default()
+    }
 }
 
 /// An icon-grid tile's background: highlighted when selected, with a thin focus
@@ -2590,6 +3058,21 @@ fn chevron_button_style(theme: &Theme, status: button::Status) -> button::Style 
     };
     if matches!(status, button::Status::Hovered | button::Status::Pressed) {
         style.text_color = palette.primary.strong.color;
+    }
+    style
+}
+
+/// A column-header button: flat (no fill), with only a faint hover tint — so the
+/// header reads as plain labels separated by dividers, not filled blocks.
+fn header_button_style(theme: &Theme, status: button::Status) -> button::Style {
+    let palette = theme.extended_palette();
+    let mut style = button::Style {
+        background: None,
+        text_color: palette.background.base.text,
+        ..button::Style::default()
+    };
+    if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+        style.background = Some(palette.background.weak.color.into());
     }
     style
 }
@@ -3093,6 +3576,79 @@ fn visible_window(scroll_y: f32, viewport_h: f32, total: usize) -> (usize, usize
     window_for(scroll_y, viewport_h, total, ROW_HEIGHT, OVERSCAN)
 }
 
+/// The widest rendered width among `cells`, measuring only the longest
+/// `COLUMN_SAMPLE` of them by character count. Character length is a strong
+/// proxy for pixel width, so sampling the longest few finds the true widest cell
+/// while keeping the (comparatively costly) text measurement bounded on folders
+/// with very many rows.
+fn sample_widest(mut cells: Vec<&str>) -> f32 {
+    /// How many of the longest cells to actually measure per column.
+    const COLUMN_SAMPLE: usize = 48;
+    cells.sort_unstable_by_key(|s| std::cmp::Reverse(s.chars().count()));
+    cells
+        .iter()
+        .take(COLUMN_SAMPLE)
+        .map(|s| measure_width(s, LIST_TEXT_SIZE))
+        .fold(0.0, f32::max)
+}
+
+/// Resolve the four columns' pixel widths for a list pane `pane_w` wide, from the
+/// cached content measurements and the folder's layout rules. Date/Type/Size
+/// auto-fit their content (or take a pinned width); Name fills the leftover width
+/// down to a content floor (unless pinned). The returned `content` width exceeds
+/// `pane_w` exactly when the columns need horizontal scrolling.
+fn compute_col_px(pane_w: f32, measure: ColumnMeasure, layout: ColumnLayout) -> ColumnPx {
+    // A non-Name column: pinned width (clamped) or its content fit, never thinner
+    // than MIN_COL_W.
+    let fixed = |rule: ColRule, fit: f32| match rule {
+        ColRule::Fixed(px) => px.clamp(MIN_COL_W, MAX_COL_W),
+        _ => fit.max(MIN_COL_W),
+    };
+    let modified = fixed(layout.modified, measure.modified);
+    let type_ = fixed(layout.type_, measure.type_);
+    let size = fixed(layout.size, measure.size);
+
+    // Everything outside the Name cell: outer padding, the icon, the four inter-
+    // column gaps (after icon/name/date/type — none after the last column, so it
+    // hugs the right edge), and the three fixed columns.
+    let non_name =
+        LIST_PAD.left + ICON_W + 4.0 * COL_GAP + modified + type_ + size + LIST_PAD.right;
+    let name_floor = measure.name.max(MIN_NAME_W);
+    let name = match layout.name {
+        ColRule::Fixed(px) => px.clamp(MIN_NAME_W, MAX_COL_W),
+        // Fill the pane, but never collapse below what the names need.
+        ColRule::Fill => (pane_w - non_name).max(name_floor),
+        ColRule::Auto => name_floor,
+    };
+    ColumnPx {
+        name,
+        modified,
+        type_,
+        size,
+        content: non_name + name,
+    }
+}
+
+/// The `(min, max)` width a column can be dragged to. Name keeps a larger floor
+/// so it stays usable; all columns share one generous ceiling.
+fn width_bounds(col: Column) -> (f32, f32) {
+    match col {
+        Column::Name => (MIN_NAME_W, MAX_COL_W),
+        _ => (MIN_COL_W, MAX_COL_W),
+    }
+}
+
+/// The sort key a column header sorts by, for deciding which column shows the
+/// sort arrow (and so reserves arrow width in its auto-fit).
+fn sort_key_of(col: Column) -> SortKey {
+    match col {
+        Column::Name => SortKey::Name,
+        Column::Modified => SortKey::Modified,
+        Column::Type => SortKey::Type,
+        Column::Size => SortKey::Size,
+    }
+}
+
 /// The thumbnail key for a grid row at pixel size `px`, or `None` for rows with
 /// no real path (the "This PC" pseudo-root never appears in the list, but drives
 /// and folders all carry a path here).
@@ -3143,6 +3699,60 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A measure where each column has a distinct, easy-to-track content width.
+    fn measure() -> ColumnMeasure {
+        ColumnMeasure {
+            name: 200.0,
+            modified: 120.0,
+            type_: 80.0,
+            size: 60.0,
+        }
+    }
+
+    /// Everything outside the Name cell, for the default measure above (four
+    /// inter-column gaps — none trails the last column).
+    fn non_name() -> f32 {
+        LIST_PAD.left + ICON_W + 4.0 * COL_GAP + 120.0 + 80.0 + 60.0 + LIST_PAD.right
+    }
+
+    #[test]
+    fn fill_name_absorbs_the_leftover_pane_width() {
+        // A wide pane: Name fills, so the columns exactly span it (no h-scroll).
+        let pane = 1000.0;
+        let px = compute_col_px(pane, measure(), ColumnLayout::default());
+        assert!((px.content - pane).abs() < 0.01);
+        assert!((px.name - (pane - non_name())).abs() < 0.01);
+        // The fixed columns auto-fit to their content.
+        assert_eq!(px.modified, 120.0);
+        assert_eq!(px.type_, 80.0);
+        assert_eq!(px.size, 60.0);
+    }
+
+    #[test]
+    fn narrow_pane_floors_name_and_overflows() {
+        // Too narrow for everything: Name floors at its content width and the
+        // total content exceeds the pane, which is what triggers h-scroll.
+        let pane = 100.0;
+        let px = compute_col_px(pane, measure(), ColumnLayout::default());
+        assert_eq!(px.name, 200.0); // content floor, not collapsed
+        assert!(px.content > pane);
+    }
+
+    #[test]
+    fn pinned_widths_are_used_and_clamped() {
+        let layout = ColumnLayout {
+            name: ColRule::Fixed(300.0),
+            modified: ColRule::Fixed(5.0), // below MIN_COL_W
+            type_: ColRule::Auto,
+            size: ColRule::Fixed(9_999.0), // above MAX_COL_W
+        };
+        let px = compute_col_px(1000.0, measure(), layout);
+        assert_eq!(px.name, 300.0);
+        assert_eq!(px.modified, MIN_COL_W);
+        assert_eq!(px.type_, 80.0); // auto-fit content
+        assert_eq!(px.size, MAX_COL_W);
+    }
 
     #[test]
     fn embedded_window_icon_decodes() {
