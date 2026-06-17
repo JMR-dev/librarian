@@ -298,7 +298,6 @@ enum Content {
     },
     Folder {
         entries: Vec<Entry>,
-        loading: bool,
     },
     /// Recursive search results rooted at `root`, streamed in from ripgrep. The
     /// browsed folder (in `history`) is unchanged underneath, so leaving the
@@ -313,6 +312,14 @@ enum Content {
         done: bool,
     },
     Error(String),
+}
+
+impl Default for Content {
+    /// The empty "This PC" landing page, used as a cheap placeholder for the
+    /// active content while it's being parked or reset (about to be overwritten).
+    fn default() -> Self {
+        Content::ThisPc { drives: Vec::new() }
+    }
 }
 
 /// Cached content-fit widths (logical px) for the four details columns, including
@@ -398,6 +405,12 @@ struct Librarian {
     thumbs: ThumbCache,
     /// Monotonic token to ignore results from superseded navigations.
     load_token: u64,
+    /// Whether this tab has a directory read in flight (set on navigation,
+    /// cleared when its listing lands or errors). Drives the modal loading
+    /// overlay and lets a tab abandoned mid-load resume on return — replacing the
+    /// old habit of blanking `content` to a `loading` placeholder, so the
+    /// previous folder stays visible (dimmed) under the overlay instead.
+    load_pending: bool,
     last_click: Option<(usize, Instant)>,
     status: String,
     /// Cut/copy buffer for paste.
@@ -434,8 +447,10 @@ struct Librarian {
     /// starts (navigation / size change). Results from a superseded session are
     /// ignored for control flow (overlay release, background continuation).
     thumb_token: u64,
-    /// Whether the modal "Loading…" overlay is up: set when a fresh grid session
-    /// finds the *viewport* thumbnails cold, cleared when their extraction lands.
+    /// Whether the modal "Loading…" overlay is up. Raised while a directory read
+    /// is in flight (see `load_pending`) and while a fresh grid session finds the
+    /// *viewport* thumbnails cold; the two phases hand off so a cold folder stays
+    /// covered continuously from navigation through its thumbnails landing.
     overlay_loading: bool,
     /// Animation frame for the loading spinner, advanced by a timer while the
     /// overlay is up.
@@ -503,6 +518,7 @@ struct TabState {
     renaming: Option<Rename>,
     pending_rename: Option<(PathBuf, String)>,
     load_token: u64,
+    load_pending: bool,
     search_query: String,
     search_mode: SearchMode,
     col_layout: ColumnLayout,
@@ -654,7 +670,7 @@ impl Librarian {
             tree: Tree::new(),
             panes,
             pending_reveal: None,
-            content: Content::ThisPc { drives: Vec::new() },
+            content: Content::default(),
             rows: Vec::new(),
             sort: settings.sort,
             view_mode: settings.view_mode,
@@ -676,6 +692,7 @@ impl Librarian {
             viewport_h: 720.0 - CHROME_HEIGHT,
             window_w: 1100.0,
             tree_ratio: TREE_RATIO,
+            load_pending: false,
             thumb_token: 0,
             overlay_loading: false,
             spinner_frame: 0,
@@ -741,7 +758,7 @@ impl Librarian {
         }
         TabState {
             history: std::mem::replace(&mut self.history, History::new(Location::ThisPc)),
-            content: std::mem::replace(&mut self.content, Content::ThisPc { drives: Vec::new() }),
+            content: std::mem::take(&mut self.content),
             rows: std::mem::take(&mut self.rows),
             selection: std::mem::take(&mut self.selection),
             address: std::mem::take(&mut self.address),
@@ -751,6 +768,7 @@ impl Librarian {
             renaming: self.renaming.take(),
             pending_rename: self.pending_rename.take(),
             load_token: self.load_token,
+            load_pending: self.load_pending,
             search_query: std::mem::take(&mut self.search_query),
             search_mode: self.search_mode,
             col_layout: self.col_layout,
@@ -771,6 +789,7 @@ impl Librarian {
         self.renaming = state.renaming;
         self.pending_rename = state.pending_rename;
         self.load_token = state.load_token;
+        self.load_pending = state.load_pending;
         self.search_query = state.search_query;
         self.search_mode = state.search_mode;
         self.col_layout = state.col_layout;
@@ -792,7 +811,7 @@ impl Librarian {
         self.col_measure = ColumnMeasure::default();
         self.col_drag = None;
         self.history = History::new(location);
-        self.content = Content::ThisPc { drives: Vec::new() };
+        self.content = Content::default();
         self.rows.clear();
         self.selection = Selection::default();
         self.status.clear();
@@ -801,6 +820,7 @@ impl Librarian {
         self.renaming = None;
         self.pending_rename = None;
         self.load_token = 0;
+        self.load_pending = false;
         self.menu = None;
         self.search_query.clear();
         self.search_mode = SearchMode::default();
@@ -878,7 +898,7 @@ impl Librarian {
     fn show_active(&mut self) -> Task<Message> {
         self.menu = None;
         // A tab left mid-load had its result dropped as stale; load it now.
-        if matches!(self.content, Content::Folder { loading: true, .. }) {
+        if self.load_pending {
             return self.load_current();
         }
         let reveal = match self.history.current().clone() {
@@ -1150,23 +1170,32 @@ impl Librarian {
                 if token != self.load_token {
                     return Task::none(); // a newer navigation won
                 }
+                self.load_pending = false;
+                // The previous folder was kept on screen (under the loading
+                // overlay) during the read, so its column widths didn't pinch;
+                // now adopt the new folder's saved layout and drop the stale
+                // measurements before `recompute_rows` re-measures.
+                self.col_layout = self.column_layout_for(self.history.current());
+                self.col_measure = ColumnMeasure::default();
                 match result {
                     Ok(entries) => {
-                        self.content = Content::Folder {
-                            entries,
-                            loading: false,
-                        };
+                        self.content = Content::Folder { entries };
                         self.recompute_rows();
                         self.status = format!("{} items", self.rows.len());
                         let icons = self.request_icons();
-                        // Fresh navigation: open a locking thumbnail session so a
-                        // cold folder shows the modal overlay until its viewport
-                        // thumbnails are built.
+                        // Fresh navigation: open a locking thumbnail session. In the
+                        // grid views it re-raises the overlay (which navigation had
+                        // up) until the viewport thumbnails are built; in details
+                        // view there are none, so the overlay simply releases now
+                        // that the listing — and its columns — are ready.
                         let thumbs = self.begin_grid_session(true);
                         let rename = self.begin_pending_rename();
                         return Task::batch([icons, thumbs, rename]);
                     }
                     Err(error) => {
+                        // The read failed: release the overlay (no grid session
+                        // will) and show the error in place of the old folder.
+                        self.overlay_loading = false;
                         self.status = error.clone();
                         self.content = Content::Error(error);
                         self.rows.clear();
@@ -1177,9 +1206,7 @@ impl Librarian {
                 // An external change to the open directory: re-enumerate it in
                 // place, preserving selection and scroll (unlike navigation).
                 if let Location::Path(path) = self.history.current().clone() {
-                    self.next_token += 1;
-                    let token = self.next_token;
-                    self.load_token = token;
+                    let token = self.next_load_token();
                     return Task::perform(
                         offload(move || read_dir_all(&path).map_err(|e| e.to_string())),
                         move |result| Message::Reloaded(token, result),
@@ -1191,11 +1218,17 @@ impl Librarian {
                     return Task::none(); // a newer load superseded this refresh
                 }
                 if let Ok(entries) = result {
+                    // Should a disk-change refresh land while a navigation load is
+                    // still pending, it fulfills that load: adopt the new folder's
+                    // column layout and clear the flag so the overlay/resume logic
+                    // doesn't think a load is still owed. An ordinary in-place
+                    // refresh (no pending load) keeps the current columns.
+                    if std::mem::take(&mut self.load_pending) {
+                        self.col_layout = self.column_layout_for(self.history.current());
+                        self.col_measure = ColumnMeasure::default();
+                    }
                     let previously = self.selected_paths();
-                    self.content = Content::Folder {
-                        entries,
-                        loading: false,
-                    };
+                    self.content = Content::Folder { entries };
                     self.recompute_rows();
                     self.restore_selection(&previously);
                     self.status = format!("{} items", self.rows.len());
@@ -1218,12 +1251,10 @@ impl Librarian {
                 if self.view_mode != mode {
                     self.view_mode = mode;
                     config::save(&self.settings());
-                    // Switching into details needs fresh auto-fit widths, which are
-                    // only measured while in details (skipped by `recompute_rows`
-                    // for the grid views).
-                    if matches!(mode, ViewMode::Details) {
-                        self.col_measure = self.measure_columns();
-                    }
+                    // Switching into details needs fresh auto-fit and per-row name
+                    // widths, only measured while in details (skipped by
+                    // `recompute_rows` for the grid views).
+                    self.remeasure_details();
                     // The grid and list scroll geometries differ; start fresh at
                     // the top, then open a new (locking) thumbnail session for the
                     // new size.
@@ -1634,6 +1665,14 @@ impl Librarian {
         Task::none()
     }
 
+    /// Allocate a fresh, globally-unique load token and record it as the active
+    /// one, so any in-flight load carrying an older token is recognized as stale.
+    fn next_load_token(&mut self) -> u64 {
+        self.next_token += 1;
+        self.load_token = self.next_token;
+        self.next_token
+    }
+
     /// (Re)load whatever the history currently points at.
     fn load_current(&mut self) -> Task<Message> {
         self.selection.clear();
@@ -1645,10 +1684,6 @@ impl Librarian {
         self.search_seq = self.search_seq.wrapping_add(1);
         let location = self.history.current().clone();
         self.address = address_text(&location);
-        // Adopt this folder's saved column layout (default for untouched folders).
-        // Widths are re-measured once its rows arrive, via `recompute_rows`.
-        self.col_layout = self.column_layout_for(&location);
-        self.col_measure = ColumnMeasure::default();
 
         // Reveal & highlight the destination in the folder tree, expanding
         // ancestors as needed (a no-op target for the "This PC" root, which is
@@ -1666,11 +1701,17 @@ impl Librarian {
 
         let load = match location {
             Location::ThisPc => {
-                self.content = Content::ThisPc { drives: Vec::new() };
+                // Landing pages carry no persisted per-folder layout; reset to the
+                // default and let their (instant) load re-measure.
+                self.col_layout = ColumnLayout::default();
+                self.col_measure = ColumnMeasure::default();
+                self.content = Content::default();
                 self.rows.clear();
                 Task::perform(offload(list_drives), Message::ThisPcLoaded)
             }
             Location::Wsl => {
+                self.col_layout = ColumnLayout::default();
+                self.col_measure = ColumnMeasure::default();
                 self.content = Content::Wsl {
                     distros: Vec::new(),
                 };
@@ -1678,14 +1719,15 @@ impl Librarian {
                 Task::perform(offload(list_wsl_distros), Message::WslLoaded)
             }
             Location::Path(path) => {
-                self.next_token += 1;
-                let token = self.next_token;
-                self.load_token = token;
-                self.content = Content::Folder {
-                    entries: Vec::new(),
-                    loading: true,
-                };
-                self.rows.clear();
+                let token = self.next_load_token();
+                // Keep the previous folder on screen (dimmed under the modal
+                // overlay) while the directory read runs, rather than blanking to
+                // an empty grid — blanking is what made the columns pinch. `Loaded`
+                // swaps in the new listing and this folder's column layout once it
+                // lands; the overlay locks input and then hands off to the
+                // thumbnail session, matching the cold-thumbnail loading UX.
+                self.load_pending = true;
+                self.overlay_loading = true;
                 self.status = "Loading…".to_string();
                 Task::perform(
                     offload(move || read_dir_all(&path).map_err(|e| e.to_string())),
@@ -1964,7 +2006,7 @@ impl Librarian {
             Content::Folder { entries, .. } => {
                 let mut visible: Vec<Entry> = entries
                     .iter()
-                    .filter(|e| is_visible(e, self.show_hidden, ""))
+                    .filter(|e| is_visible(e, self.show_hidden))
                     .cloned()
                     .collect();
                 sort_entries(&mut visible, &self.sort);
@@ -1989,10 +2031,21 @@ impl Librarian {
         };
         // Drop any selection indices that no longer exist after the rebuild.
         self.selection.retain_below(self.rows.len());
-        // The content changed, so the auto-fit column widths may have too. Only
-        // the details view shows columns, so skip the measuring work otherwise.
-        if matches!(self.view_mode, ViewMode::Details) {
-            self.col_measure = self.measure_columns();
+        // The content changed, so the auto-fit column widths and per-row name
+        // widths may have too; refresh them (a no-op outside the details view).
+        self.remeasure_details();
+    }
+
+    /// Refresh the details view's measured widths: the auto-fit column widths and
+    /// each row's cached name width (for the per-row ellipsis-tooltip check). Only
+    /// the details view uses these, so it's a no-op in the grid modes.
+    fn remeasure_details(&mut self) {
+        if !matches!(self.view_mode, ViewMode::Details) {
+            return;
+        }
+        self.col_measure = self.measure_columns();
+        for row in &mut self.rows {
+            row.name_px = measure_width(&row.label, LIST_TEXT_SIZE);
         }
     }
 
@@ -2432,24 +2485,30 @@ impl Librarian {
         responsive(move |size| self.view_grid(size, px)).into()
     }
 
-    /// The placeholder shown in the file area when there are no rows.
+    /// The placeholder shown in the file area when there are no rows. Only seen
+    /// during a load when there's no previous folder to keep on screen (startup
+    /// and fresh tabs); otherwise the dimmed previous folder shows under the
+    /// overlay instead of this.
     fn empty_list_message(&self) -> Element<'_, Message> {
-        let msg = match &self.content {
-            Content::Folder { loading: true, .. } => "Loading…".to_string(),
-            Content::Search {
-                done: false, query, ..
-            } => format!("Searching for “{query}”…"),
-            Content::Search {
-                done: true,
-                query,
-                mode,
-                ..
-            } => match mode {
-                SearchMode::Name => format!("No file names match “{query}”"),
-                SearchMode::Contents => format!("No files contain “{query}”"),
-            },
-            Content::Error(e) => e.clone(),
-            _ => "Empty".to_string(),
+        let msg = if self.load_pending {
+            "Loading…".to_string()
+        } else {
+            match &self.content {
+                Content::Search {
+                    done: false, query, ..
+                } => format!("Searching for “{query}”…"),
+                Content::Search {
+                    done: true,
+                    query,
+                    mode,
+                    ..
+                } => match mode {
+                    SearchMode::Name => format!("No file names match “{query}”"),
+                    SearchMode::Contents => format!("No files contain “{query}”"),
+                },
+                Content::Error(e) => e.clone(),
+                _ => "Empty".to_string(),
+            }
         };
         container(text(msg)).padding(16).width(Fill).into()
     }
@@ -2474,7 +2533,7 @@ impl Librarian {
 
     fn view_tab(&self, i: usize) -> Element<'_, Message> {
         let active = i == self.active;
-        let title = tab_title(self.tab_location(i));
+        let title = self.tab_location(i).label();
         let label = button(ellipsized(title).size(13).width(Fill))
             .on_press(Message::SelectTab(i))
             .padding([2, 6])
@@ -2625,17 +2684,16 @@ impl Librarian {
         };
         // When the name doesn't fit its column (so the ellipsis cropped it),
         // reveal the full path in a hover tooltip — but never while editing.
-        let name: Element<'_, Message> =
-            if !renaming_this && measure_width(&data.label, LIST_TEXT_SIZE) > widths.name {
-                tooltip(
-                    name_cell,
-                    path_tooltip(full_path_text(data)),
-                    iced::widget::tooltip::Position::FollowCursor,
-                )
-                .into()
-            } else {
-                name_cell
-            };
+        let name: Element<'_, Message> = if !renaming_this && data.name_px > widths.name {
+            tooltip(
+                name_cell,
+                path_tooltip(full_path_text(data)),
+                iced::widget::tooltip::Position::FollowCursor,
+            )
+            .into()
+        } else {
+            name_cell
+        };
 
         let line = row![
             icon,
@@ -3272,19 +3330,6 @@ fn address_text(location: &Location) -> String {
     }
 }
 
-/// Short title for a tab chip: the folder's own name (or the full path for a
-/// drive root that has no file name, e.g. `C:\`), and "This PC" for the root.
-fn tab_title(location: &Location) -> String {
-    match location {
-        Location::ThisPc => "This PC".to_string(),
-        Location::Wsl => "Linux".to_string(),
-        Location::Path(path) => path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string()),
-    }
-}
-
 /// The top-level nodes of the folder tree: the user's home folder (with the
 /// known user folders nested inside, shown expanded), then a "This PC" node that
 /// holds the drives. Mirrors Windows 11's nav pane.
@@ -3344,7 +3389,7 @@ fn fetch_tree_children(location: &Location, show_hidden: bool) -> Result<Vec<Tre
             .collect()),
         Location::Path(dir) => {
             let mut dirs = read_subdirs(dir).map_err(|e| e.to_string())?;
-            dirs.retain(|e| is_visible(e, show_hidden, ""));
+            dirs.retain(|e| is_visible(e, show_hidden));
             dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
             let children = dirs
                 .into_iter()
@@ -3977,17 +4022,6 @@ mod tests {
 
         // Empty list yields an empty window.
         assert_eq!(visible_window(0.0, viewport, 0), (0, 0));
-    }
-
-    #[test]
-    fn tab_titles_use_the_folder_name() {
-        assert_eq!(tab_title(&Location::ThisPc), "This PC");
-        assert_eq!(
-            tab_title(&Location::Path(PathBuf::from("C:\\Users\\j2\\Documents"))),
-            "Documents"
-        );
-        // A drive root has no file name, so it falls back to the full path.
-        assert_eq!(tab_title(&Location::Path(PathBuf::from("C:\\"))), "C:\\");
     }
 
     #[test]

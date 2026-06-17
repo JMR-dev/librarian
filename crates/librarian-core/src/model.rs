@@ -67,12 +67,18 @@ impl Entry {
         if self.is_dir() {
             return String::new();
         }
-        Path::new(&self.name)
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-            .unwrap_or_default()
+        extension_of(Path::new(&self.name))
     }
+}
+
+/// Lowercase extension of `path` without the dot, or `""` for none/dotfiles.
+/// The single definition of "what extension does this path have", shared by
+/// [`Entry::extension`] and the search-result rows.
+pub fn extension_of(path: &Path) -> String {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default()
 }
 
 /// A browsable location. `ThisPc` and `Wsl` are the virtual roots — `ThisPc`
@@ -140,6 +146,17 @@ impl Location {
     }
 }
 
+/// The UNC hosts that resolve to WSL's filesystem: the Windows 11-canonical
+/// `wsl.localhost` and the legacy `wsl$` alias. One source of truth for
+/// recognizing a WSL path's host segment, shared by the parent/"Up" routing
+/// here and the app's tree-reveal check.
+const WSL_HOSTS: [&str; 2] = ["wsl.localhost", "wsl$"];
+
+/// Whether `host` — a UNC server segment — is one of WSL's hosts (case-insensitive).
+pub fn is_wsl_host(host: &str) -> bool {
+    WSL_HOSTS.iter().any(|h| host.eq_ignore_ascii_case(h))
+}
+
 /// Whether `p` is the root of a WSL distro — a `\\wsl.localhost\<name>` (or
 /// legacy `\\wsl$\<name>`) UNC path with nothing below the distro share. Such a
 /// path has no filesystem parent, so "Up" routes to the `Wsl` group instead.
@@ -152,7 +169,7 @@ fn is_wsl_root_path(p: &Path) -> bool {
         return false;
     };
     let server = server.to_string_lossy();
-    if !server.eq_ignore_ascii_case("wsl.localhost") && !server.eq_ignore_ascii_case("wsl$") {
+    if !is_wsl_host(&server) {
         return false;
     }
     // The UNC prefix already includes the distro (the share); a bare distro root
@@ -181,6 +198,17 @@ mod tests {
         assert_eq!(Location::Wsl.label(), "Linux");
         assert_eq!(Location::Wsl.as_path(), None);
         assert_eq!(Location::Wsl.parent(), None);
+    }
+
+    #[test]
+    fn path_label_is_the_file_name_or_full_path_for_roots() {
+        assert_eq!(Location::ThisPc.label(), "This PC");
+        assert_eq!(
+            Location::Path(PathBuf::from(r"C:\Users\j2\Documents")).label(),
+            "Documents"
+        );
+        // A drive root has no file name, so it falls back to the full path.
+        assert_eq!(Location::Path(PathBuf::from(r"C:\")).label(), r"C:\");
     }
 
     #[test]

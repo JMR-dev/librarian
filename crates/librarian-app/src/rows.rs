@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Local, Utc};
-use librarian_core::{Entry, Location};
+use librarian_core::{Entry, Location, extension_of};
 use librarian_win::{DriveInfo, DriveKind, KnownFolder, WslDistro, distro_unc_path};
 
 use crate::icons::IconKey;
@@ -23,6 +23,11 @@ pub struct Row {
     pub size: Option<u64>,
     pub modified: Option<SystemTime>,
     pub type_label: String,
+    /// Rendered width of `label` at the list text size, in logical pixels;
+    /// cached so the details view's per-row "does the name overflow its column?"
+    /// check is a float compare instead of re-shaping text every frame. `0.0`
+    /// until measured — only the details view fills it.
+    pub name_px: f32,
 }
 
 pub fn row_from_entry(entry: &Entry) -> Row {
@@ -39,6 +44,7 @@ pub fn row_from_entry(entry: &Entry) -> Row {
         size: (!is_dir).then_some(entry.size),
         modified: entry.modified,
         type_label: type_label(entry),
+        name_px: 0.0,
     }
 }
 
@@ -57,6 +63,7 @@ pub fn row_from_drive(drive: &DriveInfo) -> Row {
         size: None,
         modified: None,
         type_label: kind.to_string(),
+        name_px: 0.0,
     }
 }
 
@@ -72,6 +79,7 @@ pub fn row_from_known(folder: &KnownFolder) -> Row {
         size: None,
         modified: None,
         type_label: "File folder".to_string(),
+        name_px: 0.0,
     }
 }
 
@@ -87,6 +95,7 @@ pub fn row_from_distro(distro: &WslDistro) -> Row {
         size: None,
         modified: None,
         type_label: "Linux distribution".to_string(),
+        name_px: 0.0,
     }
 }
 
@@ -111,10 +120,11 @@ pub fn row_from_hit(hit: &SearchHit, root: &Path) -> Row {
             size: None,
             modified: None,
             type_label: "File folder".to_string(),
+            name_px: 0.0,
         };
     }
 
-    let ext = file_extension(&hit.path);
+    let ext = extension_of(&hit.path);
     let type_label = match hit.matches {
         Some(n) => format!("{} match{}", n, if n == 1 { "" } else { "es" }),
         None => ext_type_label(&ext),
@@ -127,15 +137,8 @@ pub fn row_from_hit(hit: &SearchHit, root: &Path) -> Row {
         size: None,
         modified: None,
         type_label,
+        name_px: 0.0,
     }
-}
-
-/// Lowercase extension without the dot, or `""` for none.
-fn file_extension(path: &Path) -> String {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .unwrap_or_default()
 }
 
 /// Human "type" for a file with the given (lowercase, dotless) extension.
@@ -151,12 +154,7 @@ fn type_label(entry: &Entry) -> String {
     if entry.is_dir() {
         return "File folder".to_string();
     }
-    let ext = entry.extension();
-    if ext.is_empty() {
-        "File".to_string()
-    } else {
-        format!("{} File", ext.to_uppercase())
-    }
+    ext_type_label(&entry.extension())
 }
 
 fn drive_kind_name(kind: DriveKind) -> &'static str {
