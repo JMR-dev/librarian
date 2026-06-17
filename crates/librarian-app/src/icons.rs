@@ -10,8 +10,7 @@ use std::path::PathBuf;
 
 use iced::widget::image::Handle;
 use librarian_win::{
-    IconImage, ShellWorker, computer_icon, folder_icon, icon_for_extension, icon_for_path,
-    wsl_icon,
+    IconImage, ShellWorker, computer_icon, folder_icon, icon_for_extension, icon_for_path, wsl_icon,
 };
 
 /// What an icon represents. `Path` is used for things with a per-item icon

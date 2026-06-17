@@ -2020,8 +2020,8 @@ impl Librarian {
 
         let labels: Vec<&str> = self.rows.iter().map(|row| row.label.as_str()).collect();
         let name_content = sample_widest(labels);
-        let name =
-            (name_content.max(header("Name", Column::Name)) + COL_SLACK).clamp(0.0, MAX_NAME_AUTOFIT);
+        let name = (name_content.max(header("Name", Column::Name)) + COL_SLACK)
+            .clamp(0.0, MAX_NAME_AUTOFIT);
 
         // All dates share one fixed format, so one non-empty value stands in.
         let date_sample = self
@@ -3338,7 +3338,10 @@ fn fetch_tree_children(location: &Location, show_hidden: bool) -> Result<Vec<Tre
         Location::ThisPc => Ok(list_drives().iter().map(tree_child_from_drive).collect()),
         // The "Linux" group lists the installed WSL distros (registry-sourced,
         // so listing them never starts a distro).
-        Location::Wsl => Ok(list_wsl_distros().iter().map(tree_child_from_distro).collect()),
+        Location::Wsl => Ok(list_wsl_distros()
+            .iter()
+            .map(tree_child_from_distro)
+            .collect()),
         Location::Path(dir) => {
             let mut dirs = read_subdirs(dir).map_err(|e| e.to_string())?;
             dirs.retain(|e| is_visible(e, show_hidden, ""));
