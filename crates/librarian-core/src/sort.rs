@@ -70,8 +70,16 @@ pub fn sort_entries(entries: &mut [Entry], sort: &Sort) {
     });
 }
 
+/// Case-insensitive lexical comparison of two display names — the single point
+/// all name ordering routes through (folder listings, search results, the tree),
+/// so a later switch to `StrCmpLogicalW` (natural numeric order; see the module
+/// docs) lands everywhere at once.
+pub fn cmp_name_str(a: &str, b: &str) -> Ordering {
+    a.to_lowercase().cmp(&b.to_lowercase())
+}
+
 fn cmp_name(a: &Entry, b: &Entry) -> Ordering {
-    a.name.to_lowercase().cmp(&b.name.to_lowercase())
+    cmp_name_str(&a.name, &b.name)
 }
 
 /// Decide whether an entry should be visible given the current view options.

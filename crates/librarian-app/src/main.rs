@@ -27,8 +27,8 @@ use iced::widget::{
 use iced::{Border, Center, Element, Length::Fill, Point, Size, Subscription, Task, Theme};
 
 use librarian_core::{
-    Entry, History, Location, Sort, SortKey, SortOrder, is_visible, read_dir_all, read_subdirs,
-    sort_entries,
+    Entry, History, Location, Sort, SortKey, SortOrder, cmp_name_str, is_visible, read_dir_all,
+    read_subdirs, sort_entries,
 };
 use librarian_win::{
     Apartment, DriveInfo, IconImage, KnownFolder, ShellWorker, WslDistro, copy_items,
@@ -190,7 +190,13 @@ struct Clip {
 
 /// An in-progress inline rename of the row at `index`.
 struct Rename {
+    /// Which row hosts the edit field, for rendering. May go stale if a
+    /// background refresh re-sorts the list mid-edit, so the commit keys off
+    /// `path` (the file's identity), never this index.
     index: usize,
+    /// The file being renamed, captured when editing began. Survives a re-sort,
+    /// so the commit always targets the intended file.
+    path: PathBuf,
     value: String,
 }
 
@@ -597,8 +603,8 @@ enum Message {
     MoveSelection(Nav, bool, bool),
     SelectAll,
     Activate,
-    ThisPcLoaded(Vec<DriveInfo>),
-    WslLoaded(Vec<WslDistro>),
+    ThisPcLoaded(u64, Vec<DriveInfo>),
+    WslLoaded(u64, Vec<WslDistro>),
     Loaded(u64, Result<Vec<Entry>, String>),
     /// The current directory changed on disk; re-enumerate it in place.
     DirChanged,
@@ -834,6 +840,13 @@ impl Librarian {
         self.search_mode = SearchMode::default();
         self.search_active = None;
         self.search_seq = self.search_seq.wrapping_add(1);
+        // Supersede any thumbnail session the previous tab left running so the
+        // new tab doesn't inherit its loading overlay or keep pumping its
+        // background queue; the landing load opens a fresh session.
+        self.overlay_loading = false;
+        self.thumb_token = self.thumb_token.wrapping_add(1);
+        let abandoned = std::mem::take(&mut self.bg_queue);
+        self.thumbs.release(abandoned);
     }
 
     /// The persisted column layout for `location`'s folder, or the default
@@ -1134,7 +1147,13 @@ impl Librarian {
                     existing.extend(hits);
                     let found = existing.len();
                     *done = false;
+                    // Re-sorting the grown result set reorders rows, so preserve
+                    // the selection by file identity (not index) the way an
+                    // in-place folder refresh does — otherwise a click made while
+                    // results stream in would silently retarget a different hit.
+                    let previously = self.selected_paths();
                     self.recompute_rows();
+                    self.restore_selection(&previously);
                     self.status = format!("Searching… {found} found");
                     return Task::batch([self.request_icons(), self.prefetch_thumbs(false)]);
                 }
@@ -1170,13 +1189,19 @@ impl Librarian {
                 self.status = error;
             }
             Message::RowClicked(index) => return self.on_click(index),
-            Message::ThisPcLoaded(drives) => {
+            Message::ThisPcLoaded(token, drives) => {
+                if token != self.load_token {
+                    return Task::none(); // a newer navigation superseded this drive list
+                }
                 self.content = Content::ThisPc { drives };
                 self.recompute_rows();
                 self.status = format!("{} items", self.rows.len());
                 return Task::batch([self.request_icons(), self.begin_grid_session(true)]);
             }
-            Message::WslLoaded(distros) => {
+            Message::WslLoaded(token, distros) => {
+                if token != self.load_token {
+                    return Task::none(); // a newer navigation superseded this distro list
+                }
                 self.content = Content::Wsl { distros };
                 self.recompute_rows();
                 self.status = format!("{} items", self.rows.len());
@@ -1219,6 +1244,12 @@ impl Librarian {
             Message::DirChanged => {
                 // An external change to the open directory: re-enumerate it in
                 // place, preserving selection and scroll (unlike navigation).
+                // While a search owns the screen the folder listing isn't shown
+                // (and is re-read fresh when the search clears), so skip the
+                // refresh rather than letting it land and replace the results.
+                if matches!(self.content, Content::Search { .. }) {
+                    return Task::none();
+                }
                 if let Location::Path(path) = self.history.current().clone() {
                     let token = self.next_load_token();
                     return Task::perform(
@@ -1241,6 +1272,13 @@ impl Librarian {
                 let fulfilling_load = std::mem::take(&mut self.load_pending);
                 match result {
                     Ok(entries) => {
+                        // A background refresh must not tear down an active search
+                        // view: the search owns the screen until it's cleared
+                        // (which re-reads the folder fresh). Only reachable when not
+                        // fulfilling a navigation — navigation ends any search.
+                        if !fulfilling_load && matches!(self.content, Content::Search { .. }) {
+                            return Task::none();
+                        }
                         // Fulfilling a navigation: commit to the new folder's columns
                         // before `recompute_rows` re-measures. An ordinary in-place
                         // refresh (no pending load) keeps the current columns.
@@ -1578,11 +1616,12 @@ impl Librarian {
             Message::RenameStart => {
                 self.menu = None;
                 if let Some(index) = self.selection.lead()
-                    && self.lead_path().is_some()
+                    && let Some(path) = self.lead_path()
                     && let Some(row) = self.rows.get(index)
                 {
                     self.renaming = Some(Rename {
                         index,
+                        path,
                         value: row.label.clone(),
                     });
                     return iced::widget::operation::focus(RENAME_ID);
@@ -1594,13 +1633,19 @@ impl Librarian {
                 }
             }
             Message::RenameCommit => {
-                if let Some(state) = self.renaming.take()
-                    && let Some(row) = self.rows.get(state.index)
-                    && let Location::Path(path) = &row.target
-                {
+                // Commit against the file captured when editing began, not the
+                // current row at `state.index`: a background refresh may have
+                // re-sorted the list mid-edit, leaving that index pointing at a
+                // different file (which would otherwise be renamed by mistake).
+                if let Some(state) = self.renaming.take() {
                     let new_name = state.value.trim().to_string();
-                    if !new_name.is_empty() && new_name != row.label {
-                        let path = path.clone();
+                    let old_name = state
+                        .path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or_default();
+                    if !new_name.is_empty() && new_name != old_name {
+                        let path = state.path.clone();
                         return self
                             .dispatch_op("Renaming", move |apt| rename(apt, &path, &new_name));
                     }
@@ -1737,29 +1782,33 @@ impl Librarian {
 
         let load = match location {
             Location::ThisPc => {
-                // A virtual root owes no directory read. Its landing message
-                // (`ThisPcLoaded`/`WslLoaded`) carries no load token, so a Path
-                // read still in flight from the folder we left would otherwise
-                // keep matching `load_token` and clobber this page when it lands
-                // (e.g. a slow `\\wsl.localhost\…` refresh finishing after you
-                // click "This PC"). Bump the token to mark that read stale and
-                // clear the pending flag so `show_active` doesn't try to resume it.
-                self.next_load_token();
+                // A virtual root owes no directory read. Bump the load token so a
+                // Path read still in flight from the folder we left goes stale and
+                // can't clobber this page (e.g. a slow `\\wsl.localhost\…` refresh
+                // finishing after you click "This PC"), and tag the landing message
+                // with that token so the reverse also holds: a *slow drive list*
+                // can't clobber a folder the user navigates into next. Clear the
+                // pending flag so `show_active` doesn't try to resume the read.
+                let token = self.next_load_token();
                 self.load_pending = false;
                 self.adopt_column_layout();
                 self.content = Content::default();
                 self.rows.clear();
-                Task::perform(offload(list_drives), Message::ThisPcLoaded)
+                Task::perform(offload(list_drives), move |drives| {
+                    Message::ThisPcLoaded(token, drives)
+                })
             }
             Location::Wsl => {
-                self.next_load_token();
+                let token = self.next_load_token();
                 self.load_pending = false;
                 self.adopt_column_layout();
                 self.content = Content::Wsl {
                     distros: Vec::new(),
                 };
                 self.rows.clear();
-                Task::perform(offload(list_wsl_distros), Message::WslLoaded)
+                Task::perform(offload(list_wsl_distros), move |distros| {
+                    Message::WslLoaded(token, distros)
+                })
             }
             Location::Path(path) => {
                 let token = self.next_load_token();
@@ -2019,7 +2068,12 @@ impl Librarian {
             return Task::none();
         };
         self.selection.select_one(index);
-        self.renaming = Some(Rename { index, value: name });
+        let path = dir.join(&name);
+        self.renaming = Some(Rename {
+            index,
+            path,
+            value: name,
+        });
         Task::batch([
             self.ensure_visible(index),
             iced::widget::operation::focus(RENAME_ID),
@@ -2066,7 +2120,7 @@ impl Librarian {
                 rows.sort_by(|a, b| {
                     b.is_container
                         .cmp(&a.is_container)
-                        .then_with(|| a.label.to_lowercase().cmp(&b.label.to_lowercase()))
+                        .then_with(|| cmp_name_str(&a.label, &b.label))
                 });
                 rows
             }
@@ -2309,10 +2363,15 @@ impl Librarian {
         let rows_visible = (self.viewport_h / tile_h).ceil() as usize + 1;
         let first_row = (self.scroll_y / tile_h).floor() as usize;
         let start_row = first_row.saturating_sub(GRID_OVERSCAN_ROWS);
-        let end_row = first_row + rows_visible + GRID_OVERSCAN_ROWS;
+        let end_row = first_row
+            .saturating_add(rows_visible)
+            .saturating_add(GRID_OVERSCAN_ROWS);
 
-        let start = (start_row * cols).min(self.rows.len());
-        let end = (end_row * cols).min(self.rows.len());
+        // Saturating throughout: an extreme stale `scroll_y` (a deep scroll over
+        // a since-shrunk listing) must clamp to the end, never overflow a `usize`
+        // or invert the `start..end` range the slice below relies on.
+        let start = start_row.saturating_mul(cols).min(self.rows.len());
+        let end = end_row.saturating_mul(cols).min(self.rows.len());
         self.rows[start..end]
             .iter()
             .filter_map(|row| thumb_key(row, px))
@@ -3442,7 +3501,7 @@ fn fetch_tree_children(location: &Location, show_hidden: bool) -> Result<Vec<Tre
         Location::Path(dir) => {
             let mut dirs = read_subdirs(dir).map_err(|e| e.to_string())?;
             dirs.retain(|e| is_visible(e, show_hidden));
-            dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            dirs.sort_by(|a, b| cmp_name_str(&a.name, &b.name));
             let children = dirs
                 .into_iter()
                 .map(|e| TreeChild::lazy(e.name, IconKey::Folder, Location::Path(e.path)))
@@ -3516,6 +3575,14 @@ fn is_input_shortcut(message: &Message) -> bool {
             | Message::CloseActiveTab
             | Message::NextTab
             | Message::PrevTab
+            // Not keyboard shortcuts, but they must also be dropped while the
+            // modal overlay is up: each can start a competing grid session or
+            // run a stale search and release the lock early. A pick_list's open
+            // dropdown or an already-scheduled search debounce can still fire
+            // even though the scrim swallows ordinary pointer input.
+            | Message::ViewModeChanged(_)
+            | Message::SortBy(_)
+            | Message::SearchDebounced(_)
     )
 }
 

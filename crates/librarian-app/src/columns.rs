@@ -120,7 +120,14 @@ fn decode_rule(field: &str) -> Option<ColRule> {
     match field {
         "fill" => Some(ColRule::Fill),
         "auto" => Some(ColRule::Auto),
-        other => other.parse::<f32>().ok().map(ColRule::Fixed),
+        // Reject non-finite widths: a hand-edited/corrupt "nan"/"inf" entry
+        // parses as a valid f32 but would propagate NaN through the layout math
+        // (f32::clamp returns NaN unchanged) into iced's widget sizing.
+        other => other
+            .parse::<f32>()
+            .ok()
+            .filter(|w| w.is_finite())
+            .map(ColRule::Fixed),
     }
 }
 
@@ -151,6 +158,15 @@ mod tests {
         assert_eq!(decode_layout("fill;auto;auto"), None); // too few
         assert_eq!(decode_layout("fill;auto;auto;auto;auto"), None); // too many
         assert_eq!(decode_layout("fill;auto;bogus;auto"), None); // bad field
+    }
+
+    #[test]
+    fn rejects_non_finite_fixed_widths() {
+        // A corrupt/hand-edited config must not push a NaN/Inf width into layout.
+        assert_eq!(decode_rule("nan"), None);
+        assert_eq!(decode_rule("inf"), None);
+        assert_eq!(decode_rule("-inf"), None);
+        assert_eq!(decode_rule("240"), Some(ColRule::Fixed(240.0)));
     }
 
     #[test]
