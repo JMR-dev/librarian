@@ -12,9 +12,7 @@ use std::marker::PhantomData;
 use std::sync::mpsc::{self, Sender};
 use std::thread;
 
-use windows::Win32::System::Com::{
-    CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED,
-};
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
@@ -101,7 +99,8 @@ impl ShellWorker {
             let _ = rtx.send(f(&apartment));
         });
         self.tx.send(job).expect("COM worker thread is gone");
-        rrx.recv().expect("COM worker dropped the job without replying")
+        rrx.recv()
+            .expect("COM worker dropped the job without replying")
     }
 }
 

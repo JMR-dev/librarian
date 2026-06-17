@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. v1.0.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and Release
+    runs-on: windows-2025
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          toolchain: stable
+
+      - name: Build for release
+        run: cargo build --release --locked --workspace
+
+      - name: Generate SHA256 checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Path target/release/librarian.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  librarian.exe" | Out-File -FilePath target/release/librarian.exe.sha256 -Encoding ascii
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@c95fe14b5134b883085f5e7c1e00f91a13b86905 # v2.2.0
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          name: Release ${{ github.event.inputs.version }}
+          files: |
+            target/release/librarian.exe
+            target/release/librarian.exe.sha256
+          draft: false
+          prerelease: false
+          token: ${{ secrets.GITHUB_TOKEN }}

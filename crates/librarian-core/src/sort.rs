@@ -70,24 +70,21 @@ pub fn sort_entries(entries: &mut [Entry], sort: &Sort) {
     });
 }
 
+/// Case-insensitive lexical comparison of two display names — the single point
+/// all name ordering routes through (folder listings, search results, the tree),
+/// so a later switch to `StrCmpLogicalW` (natural numeric order; see the module
+/// docs) lands everywhere at once.
+pub fn cmp_name_str(a: &str, b: &str) -> Ordering {
+    a.to_lowercase().cmp(&b.to_lowercase())
+}
+
 fn cmp_name(a: &Entry, b: &Entry) -> Ordering {
-    a.name.to_lowercase().cmp(&b.name.to_lowercase())
+    cmp_name_str(&a.name, &b.name)
 }
 
 /// Decide whether an entry should be visible given the current view options.
-///
-/// `name_filter` is the type-to-filter / search box text; an empty filter
-/// matches everything. Matching is case-insensitive substring.
-pub fn is_visible(entry: &Entry, show_hidden: bool, name_filter: &str) -> bool {
+pub fn is_visible(entry: &Entry, show_hidden: bool) -> bool {
     if !show_hidden && (entry.attrs.hidden || entry.attrs.system) {
-        return false;
-    }
-    if !name_filter.is_empty()
-        && !entry
-            .name
-            .to_lowercase()
-            .contains(&name_filter.to_lowercase())
-    {
         return false;
     }
     true
@@ -151,15 +148,7 @@ mod tests {
     fn hidden_and_system_filtered_unless_shown() {
         let mut e = entry("secret", EntryKind::File, 0);
         e.attrs.hidden = true;
-        assert!(!is_visible(&e, false, ""));
-        assert!(is_visible(&e, true, ""));
-    }
-
-    #[test]
-    fn name_filter_matches_substring_case_insensitively() {
-        let e = entry("Report.PDF", EntryKind::File, 0);
-        assert!(is_visible(&e, true, "report"));
-        assert!(is_visible(&e, true, "pdf"));
-        assert!(!is_visible(&e, true, "xls"));
+        assert!(!is_visible(&e, false));
+        assert!(is_visible(&e, true));
     }
 }

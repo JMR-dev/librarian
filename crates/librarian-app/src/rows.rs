@@ -1,13 +1,15 @@
 //! The display-row model: a uniform view over directory entries, drives, and
 //! known folders, plus human-friendly size/time formatting.
 
+use std::path::Path;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Local, Utc};
-use librarian_core::{Entry, Location};
-use librarian_win::{DriveInfo, DriveKind, KnownFolder};
+use librarian_core::{Entry, Location, extension_of};
+use librarian_win::{DriveInfo, DriveKind, KnownFolder, WslDistro, distro_unc_path};
 
 use crate::icons::IconKey;
+use crate::search::SearchHit;
 
 /// One row in the file list, independent of where it came from.
 #[derive(Debug, Clone)]
@@ -21,6 +23,11 @@ pub struct Row {
     pub size: Option<u64>,
     pub modified: Option<SystemTime>,
     pub type_label: String,
+    /// Rendered width of `label` at the list text size, in logical pixels;
+    /// cached so the details view's per-row "does the name overflow its column?"
+    /// check is a float compare instead of re-shaping text every frame. `0.0`
+    /// until measured — only the details view fills it.
+    pub name_px: f32,
 }
 
 pub fn row_from_entry(entry: &Entry) -> Row {
@@ -37,6 +44,7 @@ pub fn row_from_entry(entry: &Entry) -> Row {
         size: (!is_dir).then_some(entry.size),
         modified: entry.modified,
         type_label: type_label(entry),
+        name_px: 0.0,
     }
 }
 
@@ -55,18 +63,90 @@ pub fn row_from_drive(drive: &DriveInfo) -> Row {
         size: None,
         modified: None,
         type_label: kind.to_string(),
+        name_px: 0.0,
     }
 }
 
 pub fn row_from_known(folder: &KnownFolder) -> Row {
     Row {
         label: folder.name.to_string(),
-        icon: IconKey::Folder,
+        // Resolve the folder's real shell icon (Desktop/Documents/Downloads/…
+        // each have a distinct one in Explorer), like drives do, instead of the
+        // generic folder glyph.
+        icon: IconKey::Path(folder.path.clone()),
         is_container: true,
         target: Location::Path(folder.path.clone()),
         size: None,
         modified: None,
         type_label: "File folder".to_string(),
+        name_px: 0.0,
+    }
+}
+
+/// A row for one WSL distribution in the "Linux" landing list. Activating it
+/// navigates into the distro's `\\wsl.localhost\<name>` root; it shares the
+/// Linux/penguin icon with the WSL group node.
+pub fn row_from_distro(distro: &WslDistro) -> Row {
+    Row {
+        label: distro.name.clone(),
+        icon: IconKey::Wsl,
+        is_container: true,
+        target: Location::Path(distro_unc_path(&distro.name)),
+        size: None,
+        modified: None,
+        type_label: "Linux distribution".to_string(),
+        name_px: 0.0,
+    }
+}
+
+/// A row for one search result. The label is the path *relative to the search
+/// root* (so the result's location is visible at a glance, like an editor's
+/// search panel). A directory hit navigates when activated; a file hit opens.
+/// For contents searches `matches` is the hit count, surfaced in the Type column.
+pub fn row_from_hit(hit: &SearchHit, root: &Path) -> Row {
+    let label = hit
+        .path
+        .strip_prefix(root)
+        .unwrap_or(&hit.path)
+        .to_string_lossy()
+        .into_owned();
+
+    if hit.is_dir {
+        return Row {
+            label,
+            icon: IconKey::Folder,
+            is_container: true,
+            target: Location::Path(hit.path.clone()),
+            size: None,
+            modified: None,
+            type_label: "File folder".to_string(),
+            name_px: 0.0,
+        };
+    }
+
+    let ext = extension_of(&hit.path);
+    let type_label = match hit.matches {
+        Some(n) => format!("{} match{}", n, if n == 1 { "" } else { "es" }),
+        None => ext_type_label(&ext),
+    };
+    Row {
+        label,
+        icon: IconKey::Ext(ext),
+        is_container: false,
+        target: Location::Path(hit.path.clone()),
+        size: None,
+        modified: None,
+        type_label,
+        name_px: 0.0,
+    }
+}
+
+/// Human "type" for a file with the given (lowercase, dotless) extension.
+fn ext_type_label(ext: &str) -> String {
+    if ext.is_empty() {
+        "File".to_string()
+    } else {
+        format!("{} File", ext.to_uppercase())
     }
 }
 
@@ -74,12 +154,7 @@ fn type_label(entry: &Entry) -> String {
     if entry.is_dir() {
         return "File folder".to_string();
     }
-    let ext = entry.extension();
-    if ext.is_empty() {
-        "File".to_string()
-    } else {
-        format!("{} File", ext.to_uppercase())
-    }
+    ext_type_label(&entry.extension())
 }
 
 fn drive_kind_name(kind: DriveKind) -> &'static str {
@@ -111,7 +186,9 @@ pub fn human_size(bytes: u64) -> String {
 /// Format a timestamp in local time (e.g. `2026-06-13 09:41`).
 pub fn format_time(time: SystemTime) -> String {
     let utc: DateTime<Utc> = time.into();
-    utc.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string()
+    utc.with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M")
+        .to_string()
 }
 
 #[cfg(test)]

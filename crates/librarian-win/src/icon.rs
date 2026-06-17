@@ -20,19 +20,22 @@ use core::ffi::c_void;
 use std::mem::size_of;
 use std::path::Path;
 
-use windows::core::PCWSTR;
+use windows::Win32::Foundation::SIZE;
 use windows::Win32::Graphics::Gdi::{
-    DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO,
-    BITMAPINFOHEADER, DIB_RGB_COLORS, HBITMAP, HGDIOBJ,
+    BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC, GetDIBits,
+    GetObjectW, HBITMAP, HGDIOBJ, ReleaseDC,
 };
 use windows::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_FLAGS_AND_ATTRIBUTES,
 };
+use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{
-    SHGetFileInfoW, SHFILEINFOW, SHGFI_FLAGS, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_SMALLICON,
-    SHGFI_USEFILEATTRIBUTES,
+    FOLDERID_ComputerFolder, IShellItemImageFactory, SHCreateItemFromParsingName, SHFILEINFOW,
+    SHGFI_FLAGS, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_PIDL, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES,
+    SHGetFileInfoW, SHGetKnownFolderIDList, SIIGBF_INCACHEONLY, SIIGBF_RESIZETOFIT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
+use windows::core::PCWSTR;
 
 use crate::com::Apartment;
 use crate::util::to_wide;
@@ -53,7 +56,11 @@ pub fn icon_for_extension(_apt: &Apartment, ext: &str, large: bool) -> Option<Ic
     } else {
         format!("file.{ext}")
     };
-    extract(&to_wide(&name), FILE_ATTRIBUTE_NORMAL, icon_flags(large, true))
+    extract(
+        &to_wide(&name),
+        FILE_ATTRIBUTE_NORMAL,
+        icon_flags(large, true),
+    )
 }
 
 /// Generic folder icon.
@@ -75,8 +82,165 @@ pub fn icon_for_path(_apt: &Apartment, path: &Path, large: bool) -> Option<IconI
     )
 }
 
+/// The shell's "This PC" (Computer) icon, matching what Explorer shows for the
+/// machine root. "This PC" is a virtual shell item with no file path, so its
+/// icon is resolved from the Computer folder's id list (PIDL) rather than a path
+/// string. Must run on the COM STA thread.
+pub fn computer_icon(_apt: &Apartment, large: bool) -> Option<IconImage> {
+    let size = if large {
+        SHGFI_LARGEICON
+    } else {
+        SHGFI_SMALLICON
+    };
+    unsafe {
+        // The Computer folder's id list is allocated by the COM task allocator,
+        // so it must be freed with `CoTaskMemFree` once we're done with it.
+        let pidl = SHGetKnownFolderIDList(&FOLDERID_ComputerFolder, 0, None).ok()?;
+        let mut shfi = SHFILEINFOW::default();
+        let ok = SHGetFileInfoW(
+            // With `SHGFI_PIDL` the first argument is a PIDL, not a path string.
+            PCWSTR(pidl as *const u16),
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            Some(&mut shfi),
+            size_of::<SHFILEINFOW>() as u32,
+            SHGFI_ICON | SHGFI_PIDL | size,
+        );
+        CoTaskMemFree(Some(pidl as *const c_void));
+        if ok == 0 || shfi.hIcon.is_invalid() {
+            return None;
+        }
+        let hicon = shfi.hIcon;
+        let image = hicon_to_rgba(hicon);
+        _ = DestroyIcon(hicon);
+        image
+    }
+}
+
+/// The shell's "Linux" (WSL) icon — the penguin Explorer shows for its Linux
+/// navigation node and for each distro under it. The Linux root is a virtual
+/// shell namespace extension addressed by CLSID (not a file path), so we resolve
+/// it by parsing name. This is purely local: it touches the registered icon
+/// handler, never the `\\wsl.localhost` redirector, so it can't wake a distro.
+/// Returns `None` when the extension isn't registered (i.e. WSL absent). Must run
+/// on the COM STA thread.
+pub fn wsl_icon(_apt: &Apartment, large: bool) -> Option<IconImage> {
+    // CLSID of the "Linux" shell folder registered by WSL.
+    const LINUX_FOLDER: &str = "::{B2B4A4D1-2754-4140-A2EB-9A76D9D7CDC6}";
+    let size = if large { 32 } else { 16 };
+    let wide = to_wide(LINUX_FOLDER);
+    unsafe {
+        let factory: IShellItemImageFactory =
+            SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).ok()?;
+        // No thumbnail for a namespace folder, so the shell returns its icon.
+        let hbm = factory
+            .GetImage(SIZE { cx: size, cy: size }, SIIGBF_RESIZETOFIT)
+            .ok()?;
+        let image = hbitmap_to_rgba(hbm);
+        _ = DeleteObject(HGDIOBJ(hbm.0));
+        image
+    }
+}
+
+/// A thumbnail (or, for items without one, the scaled shell icon) for `path`,
+/// fit within a `size`×`size` box, as straight-alpha RGBA. This is the same data
+/// Explorer's icon views show. `size` should be one of the Windows thumbnail
+/// cache buckets (16/32/48/96/256) so the request hits the OS cache instead of
+/// re-rasterizing.
+///
+/// When `cache_only` is set, `SIIGBF_INCACHEONLY` asks the shell to return the
+/// image *only if it's already cached* and to do no extraction — so a miss comes
+/// back fast as `None` rather than blocking the apartment on a slow decode. With
+/// `cache_only` clear, `SIIGBF_RESIZETOFIT` (the default, value 0) asks for a
+/// thumbnail and lets the shell fall back to the type icon when none exists —
+/// exactly Explorer's behavior, but this may hit disk or invoke a provider.
+///
+/// Either way, call on a COM STA thread.
+pub fn thumbnail(_apt: &Apartment, path: &Path, size: u32, cache_only: bool) -> Option<IconImage> {
+    let wide = to_wide(&path.to_string_lossy());
+    let flags = if cache_only {
+        SIIGBF_INCACHEONLY
+    } else {
+        SIIGBF_RESIZETOFIT
+    };
+    unsafe {
+        let factory: IShellItemImageFactory =
+            SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).ok()?;
+        let hbm = factory
+            .GetImage(
+                SIZE {
+                    cx: size as i32,
+                    cy: size as i32,
+                },
+                flags,
+            )
+            .ok()?;
+        let image = hbitmap_to_rgba(hbm);
+        _ = DeleteObject(HGDIOBJ(hbm.0));
+        image
+    }
+}
+
+/// Convert a standalone 32bpp `HBITMAP` (as returned by
+/// `IShellItemImageFactory::GetImage`) to straight-alpha RGBA. The caller retains
+/// ownership of `hbm` and must `DeleteObject` it.
+///
+/// `GetImage` has two alpha quirks we normalize here:
+///   * opaque images often come back with an all-zero alpha channel (a plain DDB
+///     with no meaningful alpha) — treat those as fully opaque, or the whole
+///     image would render invisible;
+///   * images that *do* carry transparency are premultiplied (PBGRA), which Iced
+///     would composite with dark fringes — so un-premultiply the partial pixels.
+fn hbitmap_to_rgba(hbm: HBITMAP) -> Option<IconImage> {
+    let mut bm = BITMAP::default();
+    let written = unsafe {
+        GetObjectW(
+            HGDIOBJ(hbm.0),
+            size_of::<BITMAP>() as i32,
+            Some(&mut bm as *mut _ as *mut c_void),
+        )
+    };
+    if written == 0 {
+        return None;
+    }
+    let (w, h) = (bm.bmWidth.max(0) as u32, bm.bmHeight.max(0) as u32);
+    if w == 0 || h == 0 {
+        return None;
+    }
+
+    let mut bgra = get_dibits(hbm, w, h)?;
+    if bgra.chunks_exact(4).all(|px| px[3] == 0) {
+        // No usable alpha: an opaque image returned without an alpha channel.
+        for px in bgra.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+    } else {
+        // Premultiplied -> straight alpha for the partially transparent pixels.
+        for px in bgra.chunks_exact_mut(4) {
+            let a = px[3] as u32;
+            if a > 0 && a < 255 {
+                for c in &mut px[0..3] {
+                    *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
+                }
+            }
+        }
+    }
+    // BGRA -> RGBA.
+    for px in bgra.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+    Some(IconImage {
+        width: w,
+        height: h,
+        rgba: bgra,
+    })
+}
+
 fn icon_flags(large: bool, use_attributes: bool) -> SHGFI_FLAGS {
-    let size = if large { SHGFI_LARGEICON } else { SHGFI_SMALLICON };
+    let size = if large {
+        SHGFI_LARGEICON
+    } else {
+        SHGFI_SMALLICON
+    };
     let mut flags = SHGFI_ICON | size;
     if use_attributes {
         flags |= SHGFI_USEFILEATTRIBUTES;
@@ -248,5 +412,79 @@ mod tests {
             .run(|apt| folder_icon(apt, false))
             .expect("folder icon should resolve");
         assert_eq!(icon.rgba.len(), (icon.width * icon.height * 4) as usize);
+    }
+
+    #[test]
+    fn extracts_a_thumbnail_for_a_file() {
+        // A plain text file has no real thumbnail, so the shell falls back to the
+        // type icon (via SIIGBF_RESIZETOFIT) — which still exercises the full
+        // GetImage -> HBITMAP -> RGBA path, including alpha normalization.
+        let mut path = std::env::temp_dir();
+        path.push(format!("librarian-thumb-{}.txt", std::process::id()));
+        std::fs::write(&path, b"hi").unwrap();
+
+        let image = worker()
+            .run({
+                let path = path.clone();
+                move |apt| thumbnail(apt, &path, 48, false)
+            })
+            .expect("a thumbnail or fallback icon should resolve");
+
+        assert!(image.width > 0 && image.height > 0);
+        assert!(
+            image.width <= 48 && image.height <= 48,
+            "fit within the box"
+        );
+        assert_eq!(image.rgba.len(), (image.width * image.height * 4) as usize);
+        // Normalized alpha means a visible image: not fully transparent.
+        assert!(image.rgba.chunks_exact(4).any(|px| px[3] != 0));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cache_only_thumbnail_never_panics_and_is_valid_when_present() {
+        // A cache-only request must not extract: it returns `None` on a miss
+        // (the common case for a brand-new temp file) and a well-formed image on
+        // a hit. Either outcome is acceptable here — we're asserting the fast
+        // path is sound, not forcing a particular cache state.
+        let mut path = std::env::temp_dir();
+        path.push(format!("librarian-thumb-cache-{}.txt", std::process::id()));
+        std::fs::write(&path, b"hi").unwrap();
+
+        let result = worker().run({
+            let path = path.clone();
+            move |apt| thumbnail(apt, &path, 48, true)
+        });
+
+        if let Some(image) = result {
+            assert!(image.width > 0 && image.height > 0);
+            assert_eq!(image.rgba.len(), (image.width * image.height * 4) as usize);
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn wsl_icon_is_valid_when_present() {
+        // The Linux shell extension is only registered when WSL is installed, so
+        // this returns `None` on a machine without it — both outcomes are fine.
+        // When present, the decoded icon must be well-formed and visible.
+        if let Some(icon) = worker().run(|apt| wsl_icon(apt, false)) {
+            assert!(icon.width > 0 && icon.height > 0);
+            assert_eq!(icon.rgba.len(), (icon.width * icon.height * 4) as usize);
+            assert!(icon.rgba.chunks_exact(4).any(|px| px[3] != 0));
+        }
+    }
+
+    #[test]
+    fn extracts_the_computer_icon() {
+        let icon = worker()
+            .run(|apt| computer_icon(apt, false))
+            .expect("This PC icon should resolve");
+        assert!(icon.width > 0 && icon.height > 0);
+        assert_eq!(icon.rgba.len(), (icon.width * icon.height * 4) as usize);
+        // A real icon has at least one non-transparent pixel.
+        assert!(icon.rgba.chunks_exact(4).any(|px| px[3] != 0));
     }
 }

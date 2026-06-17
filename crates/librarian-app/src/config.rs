@@ -12,19 +12,27 @@
 //! ignored so a malformed or future-version file degrades to defaults rather
 //! than erroring.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use librarian_core::{Sort, SortKey, SortOrder};
 
+use crate::ViewMode;
+use crate::columns::{ColumnLayout, decode_layout, encode_layout};
+
 const FILE_NAME: &str = "librarian.config";
+/// Per-folder details-column widths live in their own file (a variable-length
+/// map, unlike the fixed `Settings` keys), in the same portable/roaming location.
+const COLUMNS_FILE_NAME: &str = "librarian-columns.config";
 const APP_DIR: &str = "Librarian";
 
 /// The persisted, user-facing view preferences. Defaults match a fresh install:
-/// hidden items off, name-ascending sort.
+/// hidden items off, name-ascending sort, details view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Settings {
     pub show_hidden: bool,
     pub sort: Sort,
+    pub view_mode: ViewMode,
 }
 
 /// Load saved settings, falling back to defaults if none are stored or the file
@@ -51,35 +59,99 @@ pub fn save(settings: &Settings) {
     let _ = std::fs::write(&path, serialize(settings));
 }
 
-/// Resolve the config file path: a pre-existing portable file wins, else the
-/// per-user roaming location.
+/// Resolve a config file path by name: a pre-existing portable file (beside the
+/// executable) wins, else the per-user roaming location. Both config files
+/// (settings and columns) share this resolution so they stay together.
 fn config_path() -> Option<PathBuf> {
-    if let Some(portable) = portable_path()
+    config_path_for(FILE_NAME)
+}
+
+fn config_path_for(file_name: &str) -> Option<PathBuf> {
+    if let Some(portable) = portable_path(file_name)
         && portable.exists()
     {
         return Some(portable);
     }
-    roaming_path()
+    roaming_path(file_name)
 }
 
-/// `librarian.config` beside the executable.
-fn portable_path() -> Option<PathBuf> {
+/// `<file_name>` beside the executable.
+fn portable_path(file_name: &str) -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    Some(exe.parent()?.join(FILE_NAME))
+    Some(exe.parent()?.join(file_name))
 }
 
-/// `%APPDATA%\Librarian\librarian.config`.
-fn roaming_path() -> Option<PathBuf> {
+/// `%APPDATA%\Librarian\<file_name>`.
+fn roaming_path(file_name: &str) -> Option<PathBuf> {
     let appdata = std::env::var_os("APPDATA")?;
-    Some(PathBuf::from(appdata).join(APP_DIR).join(FILE_NAME))
+    Some(PathBuf::from(appdata).join(APP_DIR).join(file_name))
+}
+
+/// Load the per-folder column layouts, keyed by folder path. Missing/unreadable
+/// file or malformed lines degrade to an empty map (defaults everywhere).
+pub fn load_columns() -> HashMap<PathBuf, ColumnLayout> {
+    let Some(path) = config_path_for(COLUMNS_FILE_NAME) else {
+        return HashMap::new();
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => parse_columns(&text),
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// Persist the per-folder column layouts. Best-effort, like [`save`].
+pub fn save_columns(columns: &HashMap<PathBuf, ColumnLayout>) {
+    let Some(path) = config_path_for(COLUMNS_FILE_NAME) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, serialize_columns(columns));
+}
+
+/// One folder per line: `<encoded-layout>|<path>`. A Windows path can't contain
+/// `|`, so the first `|` cleanly separates the (delimiter-free) layout fields
+/// from the path, which may contain any other character.
+fn serialize_columns(columns: &HashMap<PathBuf, ColumnLayout>) -> String {
+    let mut out = String::new();
+    for (path, layout) in columns {
+        // An all-default layout carries no information; never write it.
+        if layout.is_default() {
+            continue;
+        }
+        out.push_str(&encode_layout(layout));
+        out.push('|');
+        out.push_str(&path.to_string_lossy());
+        out.push('\n');
+    }
+    out
+}
+
+fn parse_columns(text: &str) -> HashMap<PathBuf, ColumnLayout> {
+    let mut map = HashMap::new();
+    for line in text.lines() {
+        let Some((encoded, path)) = line.split_once('|') else {
+            continue;
+        };
+        let path = path.trim();
+        if path.is_empty() {
+            continue;
+        }
+        if let Some(layout) = decode_layout(encoded.trim()) {
+            map.insert(PathBuf::from(path), layout);
+        }
+    }
+    map
 }
 
 fn serialize(settings: &Settings) -> String {
     format!(
-        "show_hidden={}\nsort_key={}\nsort_order={}\n",
+        "show_hidden={}\nsort_key={}\nsort_order={}\nview_mode={}\n",
         settings.show_hidden,
         sort_key_str(settings.sort.key),
         sort_order_str(settings.sort.order),
+        view_mode_str(settings.view_mode),
     )
 }
 
@@ -100,6 +172,11 @@ fn parse(text: &str) -> Settings {
             "sort_order" => {
                 if let Some(order) = sort_order_from(value) {
                     settings.sort.order = order;
+                }
+            }
+            "view_mode" => {
+                if let Some(mode) = view_mode_from(value) {
+                    settings.view_mode = mode;
                 }
             }
             _ => {}
@@ -142,6 +219,29 @@ fn sort_order_from(value: &str) -> Option<SortOrder> {
     }
 }
 
+fn view_mode_str(mode: ViewMode) -> &'static str {
+    match mode {
+        ViewMode::Details => "details",
+        ViewMode::Tiny => "tiny",
+        ViewMode::Small => "small",
+        ViewMode::Medium => "medium",
+        ViewMode::Large => "large",
+        ViewMode::ExtraLarge => "xlarge",
+    }
+}
+
+fn view_mode_from(value: &str) -> Option<ViewMode> {
+    match value {
+        "details" => Some(ViewMode::Details),
+        "tiny" => Some(ViewMode::Tiny),
+        "small" => Some(ViewMode::Small),
+        "medium" => Some(ViewMode::Medium),
+        "large" => Some(ViewMode::Large),
+        "xlarge" => Some(ViewMode::ExtraLarge),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +255,7 @@ mod tests {
                 order: SortOrder::Descending,
                 ..Sort::default()
             },
+            view_mode: ViewMode::ExtraLarge,
         };
         assert_eq!(parse(&serialize(&settings)), settings);
     }
@@ -170,5 +271,30 @@ mod tests {
     #[test]
     fn empty_input_is_all_defaults() {
         assert_eq!(parse(""), Settings::default());
+    }
+
+    #[test]
+    fn columns_round_trip_keeping_paths_with_separators() {
+        use crate::columns::ColRule;
+        let mut map = HashMap::new();
+        // A path with a space and a semicolon (both legal on Windows) survives,
+        // since only the first `|` splits layout from path.
+        map.insert(
+            PathBuf::from(r"C:\Users\jay\My ; Docs"),
+            ColumnLayout {
+                name: ColRule::Fixed(240.0),
+                modified: ColRule::Auto,
+                type_: ColRule::Fixed(120.0),
+                size: ColRule::Auto,
+            },
+        );
+        assert_eq!(parse_columns(&serialize_columns(&map)), map);
+    }
+
+    #[test]
+    fn default_layouts_are_not_written() {
+        let mut map = HashMap::new();
+        map.insert(PathBuf::from(r"C:\plain"), ColumnLayout::default());
+        assert!(serialize_columns(&map).is_empty());
     }
 }
