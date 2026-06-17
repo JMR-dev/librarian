@@ -8,8 +8,7 @@ files/lines touched, with the commit that carries the fix for context.
 
 ## 2026-06-17 — Inline rename could rename the WRONG file after a background refresh
 
-**Commit:** _pending_ — staged in the `feat-phase2` working tree from a comprehensive
-code review (2026-06-17). Stamp with the fix commit hash once committed.
+**Commit:** `18318c7` — "Code Review fixes" (branch `feat-phase2`)
 
 ### Symptom
 Start an inline rename (F2) on a file, then — before pressing Enter — let the open
@@ -46,8 +45,7 @@ Carry **file identity, not row position**, across a recompute:
 
 ## 2026-06-17 — Background refresh / stale landing list clobbered the visible view
 
-**Commit:** _pending_ — staged in the `feat-phase2` working tree (2026-06-17 review).
-Stamp with the fix commit hash once committed.
+**Commit:** `18318c7` — "Code Review fixes" (branch `feat-phase2`)
 
 ### Symptom
 Two related glitches:
@@ -88,8 +86,7 @@ Both are "a stale/background producer clobbers the current view":
 
 ## 2026-06-17 — Review hardening: overlay lock, tab session reset, config & grid guards
 
-**Commit:** _pending_ — staged in the `feat-phase2` working tree (2026-06-17 review).
-Stamp with the fix commit hash once committed.
+**Commit:** `18318c7` — "Code Review fixes" (branch `feat-phase2`)
 
 ### Summary
 Lower-severity fixes from the same comprehensive review:
