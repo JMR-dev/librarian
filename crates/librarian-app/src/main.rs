@@ -483,6 +483,13 @@ struct Librarian {
     /// Cached content-fit widths for the current rows (per tab). Recomputed in
     /// `recompute_rows`; the cheap per-frame resolve in `view` reads it.
     col_measure: ColumnMeasure,
+    /// Memoized `label → rendered name width` at `LIST_TEXT_SIZE`, so
+    /// `remeasure_details` shapes each distinct name once instead of re-shaping
+    /// every row on every `recompute_rows` — which a streaming search calls per
+    /// batch (otherwise O(rows × batches)). Widths depend only on the constant
+    /// text size, so entries never go stale; cleared on navigation to keep it
+    /// bounded to the current listing. App-wide, not parked per tab.
+    name_w_cache: HashMap<String, f32>,
     /// An in-progress divider drag, if any. Transient; not parked across tabs.
     col_drag: Option<ColumnDrag>,
     /// Last list-pane width measured by the `responsive` layout, stashed so
@@ -704,6 +711,7 @@ impl Librarian {
             search_seq: 0,
             col_layout: ColumnLayout::default(),
             col_measure: ColumnMeasure::default(),
+            name_w_cache: HashMap::new(),
             col_drag: None,
             list_pane_w: Cell::new(0.0),
             col_store: config::load_columns(),
@@ -1223,29 +1231,48 @@ impl Librarian {
                 if token != self.load_token {
                     return Task::none(); // a newer load superseded this refresh
                 }
-                if let Ok(entries) = result {
-                    // Should a disk-change refresh land while a navigation load is
-                    // still pending, it fulfills that load: adopt the new folder's
-                    // column layout and clear the flag so the overlay/resume logic
-                    // doesn't think a load is still owed. An ordinary in-place
-                    // refresh (no pending load) keeps the current columns.
-                    if std::mem::take(&mut self.load_pending) {
-                        self.adopt_column_layout();
+                // A disk-change refresh that lands while a navigation load is still
+                // pending *fulfills* that load, so it — not the now-superseded
+                // `Loaded` — owns clearing `load_pending` and releasing the overlay.
+                // Settle that on success *and* failure: an ordinary in-place refresh
+                // never raised the overlay, but a fulfilling one inherited it from
+                // navigation, so handling only the `Ok` path would strand the modal
+                // lock with no load left to ever clear it.
+                let fulfilling_load = std::mem::take(&mut self.load_pending);
+                match result {
+                    Ok(entries) => {
+                        // Fulfilling a navigation: commit to the new folder's columns
+                        // before `recompute_rows` re-measures. An ordinary in-place
+                        // refresh (no pending load) keeps the current columns.
+                        if fulfilling_load {
+                            self.adopt_column_layout();
+                        }
+                        let previously = self.selected_paths();
+                        self.content = Content::Folder { entries };
+                        self.recompute_rows();
+                        self.restore_selection(&previously);
+                        self.status = format!("{} items", self.rows.len());
+                        let icons = self.request_icons();
+                        // A refresh keeps you in place — re-warm thumbnails (covering
+                        // any new files) but don't flash the modal overlay.
+                        let thumbs = self.begin_grid_session(false);
+                        let rename = self.begin_pending_rename();
+                        return Task::batch([icons, thumbs, rename]);
                     }
-                    let previously = self.selected_paths();
-                    self.content = Content::Folder { entries };
-                    self.recompute_rows();
-                    self.restore_selection(&previously);
-                    self.status = format!("{} items", self.rows.len());
-                    let icons = self.request_icons();
-                    // A refresh keeps you in place — re-warm thumbnails (covering
-                    // any new files) but don't flash the modal overlay.
-                    let thumbs = self.begin_grid_session(false);
-                    let rename = self.begin_pending_rename();
-                    return Task::batch([icons, thumbs, rename]);
+                    Err(error) => {
+                        if fulfilling_load {
+                            // This refresh stood in for a navigation: release the
+                            // overlay and surface the error (mirroring `Loaded`'s
+                            // error arm) instead of leaving the lock up forever.
+                            self.overlay_loading = false;
+                            self.status = error.clone();
+                            self.content = Content::Error(error);
+                            self.rows.clear();
+                        }
+                        // An ordinary in-place refresh error leaves the current view
+                        // untouched rather than blanking it.
+                    }
                 }
-                // A transient read error during a background refresh leaves the
-                // current view untouched rather than blanking it.
             }
             Message::IconsLoaded(loaded) => {
                 for (key, image) in loaded {
@@ -1682,6 +1709,10 @@ impl Librarian {
     fn load_current(&mut self) -> Task<Message> {
         self.selection.clear();
         self.last_click = None;
+        // New listing incoming: drop the name-width memo so it can't grow
+        // unbounded across folders (widths are size-only, so this is purely a
+        // memory bound — never a correctness need).
+        self.name_w_cache.clear();
         // Navigating leaves any search behind (and stops it, if running), and
         // invalidates any debounce a last-moment keystroke may have scheduled.
         self.search_active = None;
@@ -1706,12 +1737,23 @@ impl Librarian {
 
         let load = match location {
             Location::ThisPc => {
+                // A virtual root owes no directory read. Its landing message
+                // (`ThisPcLoaded`/`WslLoaded`) carries no load token, so a Path
+                // read still in flight from the folder we left would otherwise
+                // keep matching `load_token` and clobber this page when it lands
+                // (e.g. a slow `\\wsl.localhost\…` refresh finishing after you
+                // click "This PC"). Bump the token to mark that read stale and
+                // clear the pending flag so `show_active` doesn't try to resume it.
+                self.next_load_token();
+                self.load_pending = false;
                 self.adopt_column_layout();
                 self.content = Content::default();
                 self.rows.clear();
                 Task::perform(offload(list_drives), Message::ThisPcLoaded)
             }
             Location::Wsl => {
+                self.next_load_token();
+                self.load_pending = false;
                 self.adopt_column_layout();
                 self.content = Content::Wsl {
                     distros: Vec::new(),
@@ -2046,7 +2088,16 @@ impl Librarian {
         }
         self.col_measure = self.measure_columns();
         for row in &mut self.rows {
-            row.name_px = measure_width(&row.label, LIST_TEXT_SIZE);
+            // Cache hit avoids re-shaping a name we've already measured this
+            // listing (the common case while a search streams rows in).
+            row.name_px = match self.name_w_cache.get(&row.label) {
+                Some(&w) => w,
+                None => {
+                    let w = measure_width(&row.label, LIST_TEXT_SIZE);
+                    self.name_w_cache.insert(row.label.clone(), w);
+                    w
+                }
+            };
         }
     }
 

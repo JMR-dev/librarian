@@ -15,7 +15,7 @@
 
 use std::path::Path;
 
-use librarian_core::Location;
+use librarian_core::{Location, is_wsl_host};
 
 use crate::icons::IconKey;
 
@@ -353,7 +353,7 @@ fn is_wsl_path(target: &Path) -> bool {
     };
     let host_len = rest.find(['\\', '/']).unwrap_or(rest.len());
     let host = &rest[..host_len];
-    host.eq_ignore_ascii_case("wsl.localhost") || host.eq_ignore_ascii_case("wsl$")
+    is_wsl_host(host)
 }
 
 /// Among `children`, the index of the one whose path is the longest prefix of
