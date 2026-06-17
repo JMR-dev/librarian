@@ -79,3 +79,56 @@ pub fn extract_icons(worker: &ShellWorker, keys: Vec<IconKey>) -> Vec<(IconKey, 
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ext(name: &str) -> IconKey {
+        IconKey::Ext(name.to_string())
+    }
+
+    #[test]
+    fn take_unrequested_returns_each_key_once_across_calls() {
+        let mut cache = IconCache::default();
+
+        // First sight of these keys: all are handed back for extraction.
+        let first = cache.take_unrequested([IconKey::Folder, ext("txt")]);
+        assert_eq!(first, vec![IconKey::Folder, ext("txt")]);
+
+        // They're now in-flight, so asking again yields nothing — each icon is
+        // only extracted once, even before its handle has come back.
+        assert!(
+            cache
+                .take_unrequested([IconKey::Folder, ext("txt")])
+                .is_empty()
+        );
+
+        // A genuinely new key still comes through.
+        assert_eq!(cache.take_unrequested([ext("rs")]), vec![ext("rs")]);
+    }
+
+    #[test]
+    fn take_unrequested_dedupes_within_a_single_call() {
+        let mut cache = IconCache::default();
+        // The same key repeated in one batch is requested only once.
+        let out = cache.take_unrequested([ext("txt"), ext("txt"), IconKey::Folder]);
+        assert_eq!(out, vec![ext("txt"), IconKey::Folder]);
+    }
+
+    #[test]
+    fn cached_keys_are_not_requested_again() {
+        let mut cache = IconCache::default();
+        let image = IconImage {
+            width: 1,
+            height: 1,
+            rgba: vec![0, 0, 0, 0],
+        };
+
+        assert!(cache.get(&IconKey::Folder).is_none());
+        cache.insert(IconKey::Folder, image);
+        // Once a handle is cached, get() resolves it and take_unrequested skips it.
+        assert!(cache.get(&IconKey::Folder).is_some());
+        assert!(cache.take_unrequested([IconKey::Folder]).is_empty());
+    }
+}
